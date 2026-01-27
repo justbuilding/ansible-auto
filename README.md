@@ -11,9 +11,12 @@
   - ✅ 联网部署：支持在线环境，自动下载所需组件
   - ✅ 混合模式：离线使用本地镜像包，缺失组件自动在线下载
 
-- **国产化系统支持**：
-  - ✅ 麒麟操作系统 (Kylin OS) V10
-  - ✅ 其他基于Linux的国产操作系统
+- **系统支持**：
+  - ✅ 国产化系统 (Kylin V10)
+  - ✅ 其他基于Linux的操作系统:
+    - Ubuntu (Ubuntu server 24.04 LTS)
+    - CentOS (CentOS Stream 9)
+    - RHEL (Red Hat Enterprise Linux 9)
 
 - **跨平台兼容**：
   - ✅ AMD64 (x86_64) 架构
