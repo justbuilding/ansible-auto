@@ -1,0 +1,178 @@
+---
+- name: 重置Kubernetes和Docker环境
+  hosts: all
+  gather_facts: no
+  become: yes
+  
+  tasks:
+    - name: 重置Sealos集群
+      shell: echo {{ inventory_hostname }} | sealos reset
+      register: sealos_reset_result
+      ignore_errors: yes
+      changed_when: sealos_reset_result.rc == 0
+    
+    - name: 杀死kubelet进程
+      shell: ps -ef | grep -v grep | grep 'kubelet' | awk '{print $2}' | xargs -I % kill -9 % 2>/dev/null
+      register: kill_kubelet_result
+      ignore_errors: yes
+      changed_when: kill_kubelet_result.rc == 0
+    
+    - name: 杀死kube-proxy进程
+      shell: ps -ef | grep -v grep | grep 'kube-prox' | awk '{print $2}' | xargs -I % kill -9 % 2>/dev/null
+      register: kill_kube_proxy_result
+      ignore_errors: yes
+      changed_when: kill_kube_proxy_result.rc == 0
+    
+    - name: 杀死kube-apiserver进程
+      shell: ps -ef | grep -v grep | grep 'kube-apiserve' | awk '{print $2}' | xargs -I % kill -9 % 2>/dev/null
+      register: kill_kube_apiserver_result
+      ignore_errors: yes
+      changed_when: kill_kube_apiserver_result.rc == 0
+    
+    - name: 停止Docker服务
+      systemd:
+        name: docker
+        state: stopped
+      ignore_errors: yes
+    
+    - name: 停止containerd服务
+      systemd:
+        name: containerd
+        state: stopped
+      ignore_errors: yes
+    
+    - name: 删除Docker网络命名空间
+      shell: sudo ip netns delete $(sudo ip netns list | grep docker | awk '{print $1}') 2>/dev/null
+      register: delete_netns_result
+      ignore_errors: yes
+      changed_when: delete_netns_result.rc == 0
+    
+    - name: 显示docker0网桥的veth接口
+      shell: brctl show docker0 | grep veth | awk '{print $1}'
+      register: docker0_veth_result
+      ignore_errors: yes
+      changed_when: false
+    
+    - name: 关闭docker0网桥
+      shell: sudo ip link set docker0 down
+      register: docker0_down_result
+      ignore_errors: yes
+      changed_when: docker0_down_result.rc == 0
+    
+    - name: 删除docker0网桥
+      shell: sudo ip link delete docker0
+      register: delete_docker0_result
+      ignore_errors: yes
+      changed_when: delete_docker0_result.rc == 0
+    
+    - name: 清空Docker相关iptables链（filter表）
+      shell: |
+        sudo iptables -F DOCKER 2>/dev/null
+        sudo iptables -F DOCKER-ISOLATION-STAGE-1 2>/dev/null
+        sudo iptables -F DOCKER-ISOLATION-STAGE-2 2>/dev/null
+        sudo iptables -F DOCKER-user 2>/dev/null
+      register: iptables_filter_result
+      ignore_errors: yes
+      changed_when: iptables_filter_result.rc == 0
+    
+    - name: 清空Docker相关iptables链（nat表）
+      shell: sudo iptables -t nat -F DOCKER 2>/dev/null
+      register: iptables_nat_result
+      ignore_errors: yes
+      changed_when: iptables_nat_result.rc == 0
+    
+    - name: 删除Docker相关iptables链（filter表）
+      shell: |
+        sudo iptables -X DOCKER 2>/dev/null
+        sudo iptables -X DOCKER-ISOLATION-STAGE-1 2>/dev/null
+        sudo iptables -X DOCKER-ISOLATION-STAGE-2 2>/dev/null
+        sudo iptables -X DOCKER-user 2>/dev/null
+      register: iptables_filter_delete_result
+      ignore_errors: yes
+      changed_when: iptables_filter_delete_result.rc == 0
+    
+    - name: 删除Docker相关iptables链（nat表）
+      shell: sudo iptables -t nat -X DOCKER 2>/dev/null
+      register: iptables_nat_delete_result
+      ignore_errors: yes
+      changed_when: iptables_nat_delete_result.rc == 0
+    
+    - name: 保存iptables规则（CentOS/RHEL）
+      shell: sudo service iptables save
+      when: ansible_os_family == "RedHat"
+      register: iptables_save_result
+      ignore_errors: yes
+      changed_when: iptables_save_result.rc == 0
+    
+    - name: 保存iptables规则（Ubuntu/Debian）
+      shell: sudo netfilter-persistent save
+      when: ansible_os_family == "Debian"
+      register: netfilter_save_result
+      ignore_errors: yes
+      changed_when: netfilter_save_result.rc == 0
+    
+    - name: 删除Docker网络配置目录
+      file:
+        path: "{{ item }}"
+        state: absent
+      with_items:
+        - /etc/docker/network
+        - /var/lib/docker/network
+    
+    - name: 删除Kubernetes和etcd相关目录
+      file:
+        path: "{{ item }}"
+        state: absent
+      with_items:
+        - /var/lib/etcd
+        - /etc/kubernetes/
+        - /etc/cni/net.d
+    
+    - name: 删除Docker和containerd二进制文件
+      shell: rm -rf /usr/bin/docker* /usr/bin/containerd* 2>/dev/null
+      register: delete_binaries_result
+      ignore_errors: yes
+      changed_when: delete_binaries_result.rc == 0
+    
+    - name: 处理overlay挂载点
+      shell: |
+        # 检查overlay挂载点
+        overlay_mounts=$(mount | grep overlay | grep containers)
+        if [ -n "$overlay_mounts" ]; then
+          echo "找到overlay挂载点，开始卸载"
+          # 尝试正常卸载
+          umount /var/lib/containers/storage/overlay 2>/dev/null || true
+          # 尝试强制卸载
+          umount -l /var/lib/containers/storage/overlay 2>/dev/null || true
+          echo "overlay挂载点处理完成"
+        else
+          echo "未找到overlay挂载点，跳过卸载步骤"
+        fi
+      register: overlay_result
+      ignore_errors: yes
+      changed_when: "'找到overlay挂载点' in overlay_result.stdout"
+
+    - name: 删除Sealos相关目录
+      file:
+        path: /var/lib/sealos
+        state: absent
+
+    - name: 删除containers相关目录
+      shell: |
+        # 强制删除containers目录
+        rm -rf /var/lib/containers/ 2>/dev/null || true
+        # 检查删除结果
+        if [ ! -d "/var/lib/containers/" ]; then
+          echo "成功删除/var/lib/containers/目录"
+          exit 0
+        else
+          echo "删除/var/lib/containers/目录失败，可能仍有挂载点"
+          exit 1
+        fi
+      register: containers_delete_result
+      ignore_errors: yes
+      changed_when: containers_delete_result.rc == 0
+    
+    - name: 显示重置完成信息
+      debug:
+        msg: "Kubernetes和Docker环境重置完成！"

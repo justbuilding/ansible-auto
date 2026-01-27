@@ -1,0 +1,81 @@
+---
+# Docker配置任务
+- name: Docker配置
+  block:
+    - name: 检查Docker是否已安装和可用
+      shell: command -v docker > /dev/null 2>&1 && docker info > /dev/null 2>&1
+      register: docker_available
+      changed_when: false
+      ignore_errors: yes
+
+    - name: 配置Docker数据目录（如果需要）
+      when: enable_docker_data_dir_change
+      block:
+        - name: 检查Docker是否已安装和可用
+          shell: command -v docker > /dev/null 2>&1 && docker info > /dev/null 2>&1
+          register: docker_available_check
+          changed_when: false
+          ignore_errors: yes
+
+        - name: 配置Docker数据目录
+          when: docker_available_check.rc == 0
+          block:
+            - name: 检查当前Docker根目录
+              shell: docker info | grep -E 'Docker Root Dir' | awk '{print $4}'
+              register: current_docker_root_dir
+              changed_when: false
+              ignore_errors: yes
+
+            - name: 停止Docker服务
+              systemd:
+                name: docker
+                state: stopped
+                enabled: yes
+              when: current_docker_root_dir.stdout != "" and current_docker_root_dir.stdout != "{{ docker_data_dir }}"
+              register: docker_stop_result
+              ignore_errors: yes
+
+            - name: 迁移Docker数据目录
+              shell: |
+                # 创建新的数据目录
+                mkdir -p {{ docker_data_dir }}
+                # 迁移现有数据
+                if [ -d "/var/lib/docker" ]; then
+                  rsync -avz --remove-source-files /var/lib/docker/ {{ docker_data_dir }}/
+                fi
+              when: docker_stop_result.rc == 0 and current_docker_root_dir.stdout != "" and current_docker_root_dir.stdout != "{{ docker_data_dir }}"
+              register: docker_migrate_result
+              ignore_errors: yes
+
+            - name: 更新Docker配置文件
+              copy:
+                content: |
+                  {
+                    "data-root": "{{ docker_data_dir }}",
+                    "registry-mirrors": [
+                      "https://docker.mirrors.ustc.edu.cn",
+                      "https://registry.docker-cn.com",
+                      "https://hub-mirror.c.163.com"
+                    ]
+                  }
+                dest: /etc/docker/daemon.json
+                mode: '0644'
+              when: docker_migrate_result.rc == 0
+              register: docker_config_update_result
+              ignore_errors: yes
+
+            - name: 重启Docker服务以应用新配置
+              systemd:
+                name: docker
+                state: restarted
+                enabled: yes
+              when: docker_config_update_result.rc == 0
+              register: docker_restart_result
+              ignore_errors: yes  # 允许重启失败，因为Sealos可能已经配置了Docker
+
+            - name: 验证Docker数据目录更改
+              shell: docker info | grep -E "Docker Root Dir.*{{ docker_data_dir }}"
+              register: docker_root_verify
+              changed_when: false
+              ignore_errors: yes
+              when: docker_restart_result.rc == 0

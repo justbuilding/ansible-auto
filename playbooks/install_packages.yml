@@ -1,0 +1,196 @@
+---
+# install_packages.yml - 安装系统包和依赖Playbook
+# 基于backup目录中的install_pkg角色，适配多种包管理系统
+
+- hosts: all
+  gather_facts: yes
+  become: true
+
+  vars:
+    # 包安装配置
+    package_operation: "install"  # install, update, remove
+    # 通用包列表
+    common_packages: 
+      - rsync
+      - screen
+      - sshpass
+      - wget
+      - curl
+      - vim
+      - git
+      - tar
+      - gzip
+      - unzip
+    # 开发工具包
+    development_packages: 
+      - gcc
+      - gcc-c++
+      - make
+      - automake
+      - autoconf
+      - libtool
+      - python3-devel
+    # 是否安装开发工具
+    install_development: false
+    # RPM包目录（用于离线安装）
+    rpm_package_dir: "/tmp/rpm_dir"
+    # DEB包目录（用于离线安装）
+    deb_package_dir: "/tmp/deb_dir"
+    # 启用离线安装
+    enable_offline_install: false
+
+  tasks:
+    - name: 导入安装包角色
+      import_role:
+        name: install_pkg
+        tasks_from: main.yml
+      when: false  # 暂时禁用旧角色，使用新的安装方式
+
+    # ===================== 在线包安装 =====================
+    - name: 在线安装系统包
+      block:
+        - name: 更新包列表（Ubuntu/Debian）
+          apt:
+            update_cache: yes
+          when: ansible_os_family == "Debian"
+
+        - name: 更新包列表（CentOS/RHEL）
+          yum:
+            update_cache: yes
+          when: ansible_os_family == "RedHat"
+
+        - name: 安装通用包（Ubuntu/Debian）
+          apt:
+            name: "{{ common_packages }}"
+            state: "{{ 'present' if package_operation == 'install' else 'absent' }}"
+          when: ansible_os_family == "Debian"
+
+        - name: 安装通用包（CentOS/RHEL）
+          yum:
+            name: "{{ common_packages }}"
+            state: "{{ 'present' if package_operation == 'install' else 'absent' }}"
+          when: ansible_os_family == "RedHat"
+
+        - name: 安装开发工具包（Ubuntu/Debian）
+          apt:
+            name: "{{ development_packages }}"
+            state: "{{ 'present' if package_operation == 'install' else 'absent' }}"
+          when: ansible_os_family == "Debian" and install_development
+
+        - name: 安装开发工具包（CentOS/RHEL）
+          yum:
+            name: "{{ development_packages }}"
+            state: "{{ 'present' if package_operation == 'install' else 'absent' }}"
+          when: ansible_os_family == "RedHat" and install_development
+
+        - name: 升级所有包（Ubuntu/Debian）
+          apt:
+            upgrade: dist
+            update_cache: yes
+          when: ansible_os_family == "Debian" and package_operation == "update"
+
+        - name: 升级所有包（CentOS/RHEL）
+          yum:
+            name: '*'
+            state: latest
+          when: ansible_os_family == "RedHat" and package_operation == "update"
+      when: not enable_offline_install
+
+    # ===================== 离线包安装 =====================
+    - name: 离线安装系统包
+      block:
+        - name: 同步RPM包目录到远程主机
+          synchronize:
+            src: "{{ rpm_package_dir }}"
+            dest: "/tmp/"
+            mode: push
+          when: ansible_os_family == "RedHat"
+
+        - name: 安装RPM包
+          shell: |
+            rpm -Uvh --force --nodeps /tmp/rpm_dir/*.rpm
+          when: ansible_os_family == "RedHat"
+          register: rpm_install_result
+          ignore_errors: yes
+
+        - name: 显示RPM安装结果
+          debug:
+            var: rpm_install_result.stdout_lines
+          when: ansible_os_family == "RedHat"
+
+        - name: 同步DEB包目录到远程主机
+          synchronize:
+            src: "{{ deb_package_dir }}"
+            dest: "/tmp/"
+            mode: push
+          when: ansible_os_family == "Debian"
+
+        - name: 安装DEB包
+          shell: |
+            dpkg -i --force-all /tmp/deb_dir/*.deb
+          when: ansible_os_family == "Debian"
+          register: deb_install_result
+          ignore_errors: yes
+
+        - name: 修复DEB包依赖
+          shell: |
+            apt-get -f install -y
+          when: ansible_os_family == "Debian" and deb_install_result.rc != 0
+
+        - name: 显示DEB安装结果
+          debug:
+            var: deb_install_result.stdout_lines
+          when: ansible_os_family == "Debian"
+      when: enable_offline_install
+
+    # ===================== 特殊工具安装 =====================
+    - name: 安装特殊工具
+      block:
+        - name: 安装rsync和screen（确保已安装）
+          package:
+            name: 
+              - rsync
+              - screen
+            state: present
+
+        - name: 检查rsync版本
+          command: rsync --version
+          register: rsync_version
+          changed_when: false
+
+        - name: 检查screen版本
+          command: screen --version
+          register: screen_version
+          changed_when: false
+
+        - name: 显示工具版本
+          debug:
+            msg: |
+              已安装工具版本：
+              - rsync: {{ rsync_version.stdout_lines[0] }}
+              - screen: {{ screen_version.stdout_lines[0] }}
+
+    # ===================== 验证安装 =====================
+    - name: 验证包安装结果
+      block:
+        - name: 检查已安装的通用包（Ubuntu/Debian）
+          apt:
+            name: "{{ common_packages }}"
+            state: present
+            check_mode: yes
+          register: apt_package_check
+          when: ansible_os_family == "Debian"
+
+        - name: 检查已安装的通用包（CentOS/RHEL）
+          yum:
+            name: "{{ common_packages }}"
+            state: present
+            check_mode: yes
+          register: yum_package_check
+          when: ansible_os_family == "RedHat"
+
+        - name: 显示包安装状态
+          debug:
+            msg: "包安装成功！"
+          when: (ansible_os_family == "Debian" and apt_package_check is success) or \
+                (ansible_os_family == "RedHat" and yum_package_check is success)

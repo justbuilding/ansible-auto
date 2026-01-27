@@ -1,0 +1,702 @@
+---
+# system_prepare.yml - 系统准备和优化Playbook
+# 结合了系统基础优化和hosts文件优化，解决Java无网环境解析问题
+
+- hosts: all
+  gather_facts: yes
+  become: true
+
+  vars:
+    # 基础优化配置
+    history_size: 200000
+    timezone: Asia/Shanghai
+    # 要关闭的服务列表
+    services_to_disable: 
+      - firewalld
+      - iptables
+      - postfix
+      - abrt-ccpp
+    # 操作控制
+    enable_apt_update: false  # 默认不执行apt缓存更新，避免卡太久
+
+  tasks:
+    # ===================== 第一步：系统基础优化 =====================
+    
+    - name: 修改sshd配置 - 禁用UseDNS并重启sshd
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^UseDNS'
+        line: 'UseDNS no'
+        state: present
+      register: sshd_config_changed
+
+    - name: 重启sshd服务以应用配置
+      service:
+        name: sshd
+        state: restarted
+      when: sshd_config_changed.changed
+
+    - name: 优化历史记录配置 - 增加历史记录数量和时间戳
+      lineinfile:
+        path: /etc/profile
+        regexp: '{{ item.regexp }}'
+        line: '{{ item.line }}'
+        state: present
+      with_items:
+        - { regexp: '^export HISTSIZE=', line: 'export HISTSIZE={{ history_size }}' }
+        - { regexp: '^export HISTTIMEFORMAT=', line: 'export HISTTIMEFORMAT="%F %T:"' }
+
+    - name: 关闭SELinux（配置文件）
+      lineinfile:
+        path: /etc/selinux/config
+        regexp: '^SELINUX='
+        line: 'SELINUX=disabled'
+        state: present
+      when: ansible_os_family == "RedHat"
+
+    - name: 即时关闭SELinux
+      command: setenforce 0
+      ignore_errors: yes
+      when: ansible_os_family == "RedHat"
+
+    - name: 关闭swap（配置文件）
+      lineinfile:
+        path: /etc/fstab
+        regexp: '^.*swap.*$'
+        state: absent
+
+    - name: 即时关闭swap
+      command: swapoff -a
+      ignore_errors: yes
+
+    - name: 设置系统时区为{{ timezone }}
+      timezone:
+        name: '{{ timezone }}'
+
+    - name: 关闭并禁用不需要的服务
+      service:
+        name: '{{ item }}'
+        state: stopped
+        enabled: no
+        daemon_reload: no
+      with_items: '{{ services_to_disable }}'
+      ignore_errors: yes
+
+    # ===================== 第二步：系统内核参数优化 =====================
+    
+    - name: 配置sysctl.conf优化参数
+      sysctl:
+        name: '{{ item.name }}'
+        value: '{{ item.value }}'
+        state: present
+        reload: no
+        sysctl_file: /etc/sysctl.d/sysctl.conf
+      with_items:
+        - { name: 'vm.swappiness', value: 0 }
+        - { name: 'vm.max_map_count', value: 655360 }
+        - { name: 'fs.file-max', value: 655360 }
+        - { name: 'net.ipv4.ip_forward', value: 1 }
+        - { name: 'net.ipv4.tcp_fastopen', value: 3 }
+        - { name: 'net.ipv4.tcp_max_syn_backlog', value: 4096 }
+        - { name: 'net.ipv4.tcp_sack', value: 1 }
+        - { name: 'net.ipv4.tcp_syncookies', value: 1 }
+        - { name: 'net.ipv4.tcp_timestamps', value: 1 }
+        - { name: 'net.ipv4.tcp_tw_recycle', value: 0 }
+        - { name: 'net.ipv4.tcp_tw_reuse', value: 1 }
+        - { name: 'net.ipv4.ip_local_reserved_ports', value: '2379,7321,8001,8003,8005-8007,8020-8027,8030-8036,8040-8045,8047,8050-8051,8080-8082,8088,8499-8501,9200' }
+      register: sysctl_config
+
+    # ===================== 第三步：Kubernetes网桥转发配置 =====================
+    
+    - name: 配置Kubernetes网桥转发参数
+      sysctl:
+        name: '{{ item.name }}'
+        value: '{{ item.value }}'
+        state: present
+        reload: no
+        sysctl_file: /etc/sysctl.d/kubernetes.conf
+      with_items:
+        - { name: 'net.bridge.bridge-nf-call-ip6tables', value: 1 }
+        - { name: 'net.bridge.bridge-nf-call-iptables', value: 1 }
+        - { name: 'net.ipv4.ip_forward', value: 1 }
+      register: kubernetes_sysctl_config
+
+    - name: 使sysctl配置生效
+      command: sysctl --system
+      when: sysctl_config.changed or kubernetes_sysctl_config.changed
+      ignore_errors: yes
+
+    - name: 加载br_netfilter模块
+      modprobe:
+        name: br_netfilter
+        state: present
+
+    - name: 确保br_netfilter模块开机自动加载
+      lineinfile:
+        path: /etc/modules-load.d/br_netfilter.conf
+        line: 'br_netfilter'
+        state: present
+        create: yes
+
+    # ===================== 第四步：资源限制优化 =====================
+    
+    - name: 配置limits.conf优化参数
+      pam_limits:
+        domain: '{{ item.domain }}'
+        limit_type: '{{ item.limit_type }}'
+        limit_item: '{{ item.limit_item }}'
+        value: '{{ item.value }}'
+      with_items:
+        - { domain: '*', limit_type: 'soft', limit_item: 'nproc', value: 2048 }
+        - { domain: '*', limit_type: 'hard', limit_item: 'nproc', value: 16384 }
+        - { domain: '*', limit_type: 'soft', limit_item: 'nofile', value: 8192 }
+        - { domain: '*', limit_type: 'hard', limit_item: 'nofile', value: 65536 }
+        - { domain: '*', limit_type: 'soft', limit_item: 'memlock', value: 'unlimited' }
+        - { domain: '*', limit_type: 'hard', limit_item: 'memlock', value: 'unlimited' }
+
+    # ===================== 第五步：hosts文件优化（解决Java无网环境解析问题） =====================
+    
+    - name: 获取主机名
+      command: hostname
+      register: hostname_result
+
+    - name: 获取内网IP地址
+      shell: >
+        if [[ "$(uname)" == "Darwin" ]]; then
+          ifconfig | grep -E 'inet [0-9\.]+ netmask' | grep -v '127.0.0.1' | awk '{print $2}' | head -n 1
+        else
+          ip addr | grep -E 'inet [0-9\.]+/24' | grep -v '127.0.0.1' | grep -v 'docker' | grep -v 'veth' | awk '{print $2}' | cut -d '/' -f1 | head -n 1
+        fi
+      register: inner_ip_result
+      ignore_errors: yes
+
+    - name: 设置内网IP（若未获取到则使用127.0.0.1）
+      set_fact:
+        inner_ip: "{{ inner_ip_result.stdout if inner_ip_result.stdout != '' else '127.0.0.1' }}"
+
+    - name: 检查hosts文件中是否已存在Java解析优化配置
+      lineinfile:
+        path: /etc/hosts
+        regexp: '^# ====== Java无网环境解析优化 ======'
+        state: absent
+      check_mode: yes
+      register: java_hosts_check
+
+    - name: 向hosts文件添加Java解析优化配置
+      block:
+        - name: 添加Java解析优化配置到hosts文件
+          blockinfile:
+            path: /etc/hosts
+            block: |
+              
+              # ====== Java无网环境解析优化（自动添加，{{ ansible_date_time.date }}） ======
+              127.0.0.1   {{ inventory_hostname }} localhost
+              ::1         {{ inventory_hostname }} localhost
+              {{ inner_ip }}   {{ inventory_hostname }}
+            marker: "# {mark} ANSIBLE MANAGED BLOCK - Java无网环境解析优化"
+
+        - name: 验证hosts文件配置
+          command: grep -E "{{ inventory_hostname }}|127.0.0.1.*localhost" /etc/hosts
+          register: hosts_verification
+          changed_when: false
+
+        - name: 显示hosts配置结果
+          debug:
+            msg: "{{ hosts_verification.stdout_lines }}"
+
+      when: not java_hosts_check.changed
+
+    # ===================== 第六步：网络连接检测 =====================
+    
+    - name: 检测网络连接（ping 8.8.8.8）
+      shell: ping -c 2 -W 3 8.8.8.8 > /dev/null 2>&1 || echo "no_internet"
+      register: internet_check
+      ignore_errors: yes
+      changed_when: false
+    
+    - name: 备用网络连接检测（curl）
+      shell: curl -s -m 3 https://www.baidu.com > /dev/null 2>&1 && echo "internet" || echo "no_internet"
+      register: internet_check_curl
+      ignore_errors: yes
+      changed_when: false
+    
+    - name: 确定最终网络连接状态
+      set_fact:
+        final_internet_check: "{{ 'internet' if internet_check.stdout != 'no_internet' or internet_check_curl.stdout == 'internet' else 'no_internet' }}"
+    
+    - name: 显示网络连接状态
+      debug:
+        msg: "网络连接状态: {{ '已连接' if final_internet_check != 'no_internet' else '未连接' }}"
+    
+    # ===================== 第七步：配置国内加速源 =====================
+    
+    - name: 配置Ubuntu国内加速源
+      block:
+        - name: 安装lsb-release包（用于获取发行版代号）
+          apt:
+            name: lsb-release
+            state: present
+          when: ansible_os_family == "Debian"
+          ignore_errors: yes
+        
+        - name: 获取Ubuntu发行版代号
+          shell: lsb_release -c | cut -f2
+          register: ubuntu_codename
+          when: ansible_os_family == "Debian"
+        
+        - name: 检查Ubuntu是否使用新的sources格式
+          stat:
+            path: /etc/apt/sources.list.d/ubuntu.sources
+          register: new_sources_format
+          when: ansible_os_family == "Debian"
+        
+        - name: 备份所有sources配置
+          shell: mkdir -p /etc/apt/sources.backup && cp -f /etc/apt/sources.list /etc/apt/sources.list.d/* /etc/apt/sources.backup/ || true
+          when: ansible_os_family == "Debian"
+        
+        - name: 清理旧的sources.list文件（新格式系统）
+          file:
+            path: /etc/apt/sources.list
+            state: absent
+          when: ansible_os_family == "Debian" and new_sources_format.stat.exists
+        
+        - name: 配置Ubuntu国内加速源（旧格式）
+          copy:
+            content: |
+              # Ubuntu {{ ansible_distribution_version }} ({{ ubuntu_codename.stdout }}) 源
+              deb http://ports.ubuntu.com/ubuntu-ports/ {{ ubuntu_codename.stdout }} main restricted universe multiverse
+              deb-src http://ports.ubuntu.com/ubuntu-ports/ {{ ubuntu_codename.stdout }} main restricted universe multiverse
+              
+              deb http://ports.ubuntu.com/ubuntu-ports/ {{ ubuntu_codename.stdout }}-security main restricted universe multiverse
+              deb-src http://ports.ubuntu.com/ubuntu-ports/ {{ ubuntu_codename.stdout }}-security main restricted universe multiverse
+              
+              deb http://ports.ubuntu.com/ubuntu-ports/ {{ ubuntu_codename.stdout }}-updates main restricted universe multiverse
+              deb-src http://ports.ubuntu.com/ubuntu-ports/ {{ ubuntu_codename.stdout }}-updates main restricted universe multiverse
+              
+              deb http://ports.ubuntu.com/ubuntu-ports/ {{ ubuntu_codename.stdout }}-backports main restricted universe multiverse
+              deb-src http://ports.ubuntu.com/ubuntu-ports/ {{ ubuntu_codename.stdout }}-backports main restricted universe multiverse
+            dest: /etc/apt/sources.list
+            mode: '0644'
+          when: ansible_os_family == "Debian" and not new_sources_format.stat.exists
+        
+        - name: 配置Ubuntu国内加速源（新格式）
+          copy:
+            content: |
+              Types: deb
+              URIs: http://ports.ubuntu.com/ubuntu-ports/
+              Suites: {{ ubuntu_codename.stdout }} {{ ubuntu_codename.stdout }}-updates {{ ubuntu_codename.stdout }}-backports
+              Components: main restricted universe multiverse
+              Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+              
+              Types: deb
+              URIs: http://ports.ubuntu.com/ubuntu-ports/
+              Suites: {{ ubuntu_codename.stdout }}-security
+              Components: main restricted universe multiverse
+              Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+            dest: /etc/apt/sources.list.d/ubuntu.sources
+            mode: '0644'
+          when: ansible_os_family == "Debian" and new_sources_format.stat.exists
+        
+        - name: 更新apt缓存
+          apt:
+            update_cache: yes
+            cache_valid_time: 3600
+          when: ansible_os_family == "Debian" and enable_apt_update
+          ignore_errors: yes
+          timeout: 10  # 添加超时设置，秒单位
+          async: 10     # 异步执行，与timeout保持一致
+          poll: 5       # 每5秒检查一次执行状态
+        
+        - name: 显示apt缓存更新状态
+          debug:
+            msg: "apt缓存更新已默认禁用，如需启用请设置 enable_apt_update=true"
+          when: ansible_os_family == "Debian" and not enable_apt_update
+      when: ansible_os_family == "Debian" and final_internet_check != "no_internet"
+    
+    # ===================== 第八步：配置CentOS/RHEL国内加速源 =====================
+    
+    - name: 配置CentOS/RHEL国内加速源
+      block:
+        - name: 备份原始yum配置文件
+          shell: mkdir -p /etc/yum.repos.d.bak && cp -f /etc/yum.repos.d/*.repo /etc/yum.repos.d.bak/
+          when: ansible_os_family == "RedHat"
+        
+        - name: 配置CentOS 7 阿里云加速源
+          copy:
+            content: |
+              # CentOS-Base.repo
+              #
+              # The mirror system uses the connecting IP address of the client and the
+              # update status of each mirror to pick mirrors that are updated to and
+              # geographically close to the client.
+              #
+              # You should use this for CentOS updates unless you are manually picking
+              # other mirrors.
+              #
+              # If the mirrorlist= does not work for you, as a fall back you can try the 
+              # remarked out baseurl= line instead.
+              #
+              #
+              
+              
+              [base]
+              name=CentOS-$releasever - Base - mirrors.aliyun.com
+              failovermethod=priority
+              baseurl=https://mirrors.aliyun.com/centos/$releasever/os/$basearch/
+              #mirrorlist=http://mirrorlist.centos.org/?release=$releasever&arch=$basearch&repo=os
+              gpgcheck=1
+              gpgkey=https://mirrors.aliyun.com/centos/RPM-GPG-KEY-CentOS-7
+              
+              #released updates 
+              [updates]
+              name=CentOS-$releasever - Updates - mirrors.aliyun.com
+              failovermethod=priority
+              baseurl=https://mirrors.aliyun.com/centos/$releasever/updates/$basearch/
+              #mirrorlist=http://mirrorlist.centos.org/?release=$releasever&arch=$basearch&repo=updates
+              gpgcheck=1
+              gpgkey=https://mirrors.aliyun.com/centos/RPM-GPG-KEY-CentOS-7
+              
+              #additional packages that may be useful
+              [extras]
+              name=CentOS-$releasever - Extras - mirrors.aliyun.com
+              failovermethod=priority
+              baseurl=https://mirrors.aliyun.com/centos/$releasever/extras/$basearch/
+              #mirrorlist=http://mirrorlist.centos.org/?release=$releasever&arch=$basearch&repo=extras
+              gpgcheck=1
+              gpgkey=https://mirrors.aliyun.com/centos/RPM-GPG-KEY-CentOS-7
+              
+              #additional packages that extend functionality of existing packages
+              [centosplus]
+              name=CentOS-$releasever - Plus - mirrors.aliyun.com
+              failovermethod=priority
+              baseurl=https://mirrors.aliyun.com/centos/$releasever/centosplus/$basearch/
+              #mirrorlist=http://mirrorlist.centos.org/?release=$releasever&arch=$basearch&repo=centosplus
+              gpgcheck=1
+              enabled=0
+              gpgkey=https://mirrors.aliyun.com/centos/RPM-GPG-KEY-CentOS-7
+            dest: /etc/yum.repos.d/CentOS-Base.repo
+            mode: '0644'
+          when: ansible_os_family == "RedHat" and ansible_distribution_major_version == "7"
+        
+        - name: 配置CentOS 8 阿里云加速源
+          copy:
+            content: |
+              # CentOS-Base.repo
+              #
+              # The mirror system uses the connecting IP address of the client and the
+              # update status of each mirror to pick mirrors that are updated to and
+              # geographically close to the client.
+              #
+              # You should use this for CentOS updates unless you are manually picking
+              # other mirrors.
+              #
+              # If the mirrorlist= does not work for you, as a fall back you can try the 
+              # remarked out baseurl= line instead.
+              #
+              #
+              
+              
+              [baseos]
+              name=CentOS-$releasever - BaseOS - mirrors.aliyun.com
+              failovermethod=priority
+              baseurl=https://mirrors.aliyun.com/centos/$releasever/BaseOS/$basearch/os/
+              #mirrorlist=http://mirrorlist.centos.org/?release=$releasever&arch=$basearch&repo=BaseOS
+              gpgcheck=1
+              gpgkey=https://mirrors.aliyun.com/centos/RPM-GPG-KEY-CentOS-Official
+              
+              [appstream]
+              name=CentOS-$releasever - AppStream - mirrors.aliyun.com
+              failovermethod=priority
+              baseurl=https://mirrors.aliyun.com/centos/$releasever/AppStream/$basearch/os/
+              #mirrorlist=http://mirrorlist.centos.org/?release=$releasever&arch=$basearch&repo=AppStream
+              gpgcheck=1
+              gpgkey=https://mirrors.aliyun.com/centos/RPM-GPG-KEY-CentOS-Official
+              
+              [extras]
+              name=CentOS-$releasever - Extras - mirrors.aliyun.com
+              failovermethod=priority
+              baseurl=https://mirrors.aliyun.com/centos/$releasever/extras/$basearch/os/
+              #mirrorlist=http://mirrorlist.centos.org/?release=$releasever&arch=$basearch&repo=extras
+              gpgcheck=1
+              gpgkey=https://mirrors.aliyun.com/centos/RPM-GPG-KEY-CentOS-Official
+              
+              [centosplus]
+              name=CentOS-$releasever - Plus - mirrors.aliyun.com
+              failovermethod=priority
+              baseurl=https://mirrors.aliyun.com/centos/$releasever/centosplus/$basearch/os/
+              #mirrorlist=http://mirrorlist.centos.org/?release=$releasever&arch=$basearch&repo=centosplus
+              gpgcheck=1
+              enabled=0
+              gpgkey=https://mirrors.aliyun.com/centos/RPM-GPG-KEY-CentOS-Official
+            dest: /etc/yum.repos.d/CentOS-Base.repo
+            mode: '0644'
+          when: ansible_os_family == "RedHat" and ansible_distribution_major_version == "8"
+        
+        - name: 配置CentOS Stream 9 阿里云加速源
+          copy:
+            content: |
+              # CentOS-Stream-Base.repo
+              #
+              # The mirror system uses the connecting IP address of the client and the
+              # update status of each mirror to pick mirrors that are updated to and
+              # geographically close to the client.
+              #
+              # You should use this for CentOS Stream updates unless you are manually picking
+              # other mirrors.
+              #
+              # If the mirrorlist= does not work for you, as a fall back you can try the 
+              # remarked out baseurl= line instead.
+              #
+              #
+              
+              
+              [baseos]
+              name=CentOS Stream $releasever - BaseOS - mirrors.aliyun.com
+              failovermethod=priority
+              baseurl=https://mirrors.aliyun.com/centos-stream/$releasever/BaseOS/$basearch/os/
+              #mirrorlist=http://mirrorlist.centos.org/?release=$releasever&arch=$basearch&repo=BaseOS
+              gpgcheck=1
+              gpgkey=https://mirrors.aliyun.com/centos-stream/RPM-GPG-KEY-CentOS-Official
+              
+              [appstream]
+              name=CentOS Stream $releasever - AppStream - mirrors.aliyun.com
+              failovermethod=priority
+              baseurl=https://mirrors.aliyun.com/centos-stream/$releasever/AppStream/$basearch/os/
+              #mirrorlist=http://mirrorlist.centos.org/?release=$releasever&arch=$basearch&repo=AppStream
+              gpgcheck=1
+              gpgkey=https://mirrors.aliyun.com/centos-stream/RPM-GPG-KEY-CentOS-Official
+              
+              [extras]
+              name=CentOS Stream $releasever - Extras - mirrors.aliyun.com
+              failovermethod=priority
+              baseurl=https://mirrors.aliyun.com/centos-stream/$releasever/extras/$basearch/os/
+              #mirrorlist=http://mirrorlist.centos.org/?release=$releasever&arch=$basearch&repo=extras
+              gpgcheck=1
+              gpgkey=https://mirrors.aliyun.com/centos-stream/RPM-GPG-KEY-CentOS-Official
+              
+              [powertools]
+              name=CentOS Stream $releasever - PowerTools - mirrors.aliyun.com
+              failovermethod=priority
+              baseurl=https://mirrors.aliyun.com/centos-stream/$releasever/PowerTools/$basearch/os/
+              #mirrorlist=http://mirrorlist.centos.org/?release=$releasever&arch=$basearch&repo=PowerTools
+              gpgcheck=1
+              enabled=0
+              gpgkey=https://mirrors.aliyun.com/centos-stream/RPM-GPG-KEY-CentOS-Official
+            dest: /etc/yum.repos.d/CentOS-Stream-Base.repo
+            mode: '0644'
+          when: ansible_os_family == "RedHat" and (ansible_distribution_major_version == "9" or ansible_distribution == "CentOS Stream")
+        
+        - name: 清理yum缓存并生成新缓存
+          shell: yum clean all && yum makecache
+          when: ansible_os_family == "RedHat"
+          ignore_errors: yes
+      when: ansible_os_family == "RedHat" and final_internet_check != "no_internet"
+    
+    # ===================== 第九步：安装基础工具 =====================
+    
+    - name: 安装基础工具包（Ubuntu/Debian）
+      apt:
+        name: 
+          - rsync
+          - screen
+          - sshpass
+          - wget
+          - curl
+          - vim
+        state: present
+      when: ansible_os_family == "Debian"
+      ignore_errors: yes
+
+    - name: 安装基础工具包（CentOS/RHEL）
+      yum:
+        name: 
+          - rsync
+          - screen
+          - sshpass
+          - wget
+          - curl
+          - vim
+        state: present
+        update_cache: yes
+      when: ansible_os_family == "RedHat"
+      ignore_errors: yes
+
+    - name: 安装基础工具包（macOS）
+      homebrew:
+        name: 
+          - rsync
+          - screen
+          - sshpass
+          - wget
+          - curl
+          - vim
+        state: present
+      when: ansible_os_family == "Darwin"
+      become: no
+
+    # ===================== 第十步：最终验证 =====================
+    
+    - name: 验证系统优化结果
+      block:
+        - name: 检查SELinux状态
+          command: getenforce
+          register: selinux_status
+          ignore_errors: yes
+          changed_when: false
+          when: ansible_os_family == "RedHat"
+
+        - name: 检查swap状态
+          command: free -h
+          register: swap_status
+          changed_when: false
+
+        - name: 检查时区
+          command: timedatectl show --property=Timezone --value
+          register: timezone_status
+          changed_when: false
+
+        - name: 显示优化结果
+          debug:
+            msg: |
+              系统优化结果：
+              - SELinux状态: {{ selinux_status.stdout | default('未知') }}
+              - Swap状态: {{ '已关闭' if 'Swap:            0B' in swap_status.stdout else '已开启' }}
+              - 时区: {{ timezone_status.stdout }}
+              - 历史记录大小: {{ history_size }}
+              - 内网IP: {{ inner_ip }}
+              - Java无网解析优化: {{ '已配置' if not java_hosts_check.changed else '已存在' }}
+
+    # ===================== 第十一步：配置hjj.sh脚本 =====================
+    
+    - name: 配置hjj.sh脚本内容
+      block:
+        - name: 检查用户u是否存在
+          getent:
+            database: passwd
+            key: u
+          register: user_u_check
+          ignore_errors: yes
+
+        - name: 创建并配置hjj.sh脚本
+          copy:
+            content: |
+              #!/bin/bash
+              # hjj.sh - 系统准备辅助脚本
+              # 自动生成于 {{ ansible_date_time.date }} {{ ansible_date_time.time }}
+              
+              # 系统信息
+              echo "========================================="
+              echo "系统准备辅助脚本"
+              echo "========================================="
+              echo "主机名: $(hostname)"
+              echo "IP地址: $(hostname -I)"
+              echo "系统版本: $(cat /etc/os-release | grep PRETTY_NAME | cut -d'=' -f2 | tr -d '"')"
+              echo "内核版本: $(uname -r)"
+              echo "========================================="
+              
+              # 系统优化状态检查
+              echo "\n系统优化状态："
+              echo "- SSH UseDNS: $(grep -i usedns /etc/ssh/sshd_config)"
+              echo "- 历史记录大小: $(grep -i histize /etc/profile 2>/dev/null || echo "未配置")"
+              echo "- 时区: $(timedatectl show --property=Timezone --value)"
+              echo "- Swap状态: $(free -h | grep Swap)"
+              
+              # Kubernetes准备状态
+              echo "\nKubernetes准备状态："
+              echo "- br_netfilter模块: $(lsmod | grep br_netfilter || echo "未加载")"
+              echo "- ip_forward: $(sysctl net.ipv4.ip_forward)"
+              echo "========================================="
+              
+              # 帮助信息
+              echo "\n使用说明："
+              echo "- 运行此脚本查看系统准备状态"
+              echo "- 用于验证系统优化和Kubernetes准备情况"
+              echo "========================================="
+            dest: /home/u/hjj.sh
+            mode: '0755'
+          when: user_u_check.ansible_facts.getent_passwd is defined and user_u_check.ansible_facts.getent_passwd.get('u') is defined
+        
+        - name: 显示hjj.sh脚本配置结果
+          debug:
+            msg: |
+              hjj.sh脚本已配置完成！
+              脚本位置：/home/u/hjj.sh
+              执行权限：755
+              用途：系统准备状态检查和验证
+
+    # ===================== 第十二步：同步scripts目录到目标机器 =====================
+    
+    - name: 检查本地scripts目录是否存在
+      local_action: stat path="../scripts"
+      become: no
+      register: local_scripts_dir
+      ignore_errors: yes
+
+    - name: 同步scripts目录到目标机器的/root/目录
+      synchronize:
+        src: ../scripts/
+        dest: /root/scripts/
+        recursive: yes
+        mode: push
+        delete: yes
+      when: local_scripts_dir.stat.exists
+
+    - name: 执行alias.sh脚本以配置别名
+      shell: bash /root/scripts/alias.sh
+      ignore_errors: yes
+      when: local_scripts_dir.stat.exists
+
+    - name: 验证alias.sh脚本执行结果
+      shell: ls -la /etc/profile.d/alias.sh && cat /etc/profile.d/alias.sh | grep 'alias kg='
+      register: alias_verification
+      ignore_errors: yes
+      when: local_scripts_dir.stat.exists
+
+    - name: 显示别名配置验证结果
+      debug:
+        msg:
+          - "别名配置验证结果:"
+          - "{{ alias_verification.stdout_lines }}"
+      when: local_scripts_dir.stat.exists and alias_verification.stdout
+
+    - name: 手动加载别名配置（确保立即生效）
+      shell: source /etc/profile.d/alias.sh && echo "Alias configuration loaded successfully"
+      args:
+        executable: /bin/bash
+      ignore_errors: yes
+      when: local_scripts_dir.stat.exists
+
+    - name: 为Ubuntu系统添加额外的别名配置到.bashrc
+      blockinfile:
+        path: /root/.bashrc
+        block: |
+          # Load alias configuration
+          if [ -f /etc/profile.d/alias.sh ]; then
+              . /etc/profile.d/alias.sh
+          fi
+        marker: "# {mark} ANSIBLE MANAGED BLOCK - Alias Configuration"
+      when: local_scripts_dir.stat.exists and ansible_os_family == "Debian"
+
+    - name: 为普通用户u添加别名配置到.bashrc
+      blockinfile:
+        path: /home/u/.bashrc
+        block: |
+          # Load alias configuration
+          if [ -f /etc/profile.d/alias.sh ]; then
+              . /etc/profile.d/alias.sh
+          fi
+        marker: "# {mark} ANSIBLE MANAGED BLOCK - Alias Configuration"
+      when: local_scripts_dir.stat.exists and ansible_os_family == "Debian"
+      ignore_errors: yes
+
+    - name: 设置alias.sh文件权限
+      file:
+        path: /etc/profile.d/alias.sh
+        mode: '0644'
+      when: local_scripts_dir.stat.exists
+
+  handlers:
+    - name: restart sshd
+      service:
+        name: sshd
+        state: restarted

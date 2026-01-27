@@ -1,0 +1,50 @@
+---
+- name: Docker配置独立playbook
+  hosts: all
+  become: yes
+  gather_facts: yes
+  vars:
+    # Docker配置变量
+    docker_data_dir: "/var/lib/docker"
+    enable_docker_data_dir_change: true
+
+  tasks:
+    # ===================== Docker配置 =====================
+    - name: 包含Docker配置任务
+      include_tasks: tasks/configure_docker.yml
+
+    # ===================== 配置清理 =====================
+    - name: 配置清理
+      block:
+        - name: 删除旧的镜像包目录（如果存在）
+          file:
+            path: /tmp/sealos_images
+            state: absent
+          ignore_errors: yes
+
+        - name: 删除旧的Sealos二进制目录（如果存在）
+          file:
+            path: /tmp/sealos
+            state: absent
+          ignore_errors: yes
+
+- name: 部署统计
+  hosts: localhost
+  gather_facts: no
+  tasks:
+    - name: 记录部署结束时间
+      set_fact:
+        deployment_end_time: "{{ lookup('pipe', 'date +%Y-%m-%d_%H:%M:%S') }}"
+      delegate_to: localhost
+      run_once: yes
+
+    - name: 显示Docker配置完成信息
+      debug:
+        msg: |
+          ==============================================================
+          Docker配置完成
+          ==============================================================
+          结束时间：{{ deployment_end_time }}
+          ==============================================================
+      delegate_to: localhost
+      run_once: yes

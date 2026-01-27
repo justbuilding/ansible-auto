@@ -1,0 +1,111 @@
+---
+# install_docker.yml - Docker安装任务文件
+
+- name: 安装Docker CE（Ubuntu/Debian）
+  block:
+    - name: 更新apt包索引
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: 安装Docker所需的依赖包
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg-agent
+          - software-properties-common
+        state: present
+
+    - name: 添加Docker GPG密钥
+      apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        state: present
+
+    - name: 添加Docker apt仓库
+      apt_repository:
+        repo: deb [arch=amd64] https://download.docker.com/linux/ubuntu {{ ansible_lsb.codename }} stable
+        state: present
+
+    - name: 安装Docker CE
+      apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+        state: present
+        update_cache: yes
+
+    - name: 启动并启用Docker服务
+      systemd:
+        name: docker
+        state: started
+        enabled: yes
+  when: ansible_os_family == "Debian"
+
+- name: 安装Docker CE（CentOS/RHEL）
+  block:
+    - name: 安装Docker所需的依赖包
+      yum:
+        name:
+          - yum-utils
+          - device-mapper-persistent-data
+          - lvm2
+        state: present
+
+    - name: 添加Docker yum仓库
+      yum_repository:
+        name: docker-ce-stable
+        description: Docker CE Stable - $basearch
+        baseurl: https://download.docker.com/linux/centos/$releasever/$basearch/stable
+        gpgcheck: yes
+        gpgkey: https://download.docker.com/linux/centos/gpg
+        enabled: yes
+
+    - name: 安装Docker CE
+      yum:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+        state: present
+
+    - name: 启动并启用Docker服务
+      systemd:
+        name: docker
+        state: started
+        enabled: yes
+  when: ansible_os_family == "RedHat"
+
+- name: 配置Docker镜像加速
+  block:
+    - name: 创建Docker配置目录
+      file:
+        path: /etc/docker
+        state: directory
+        mode: '0755'
+
+    - name: 配置Docker daemon.json
+      copy:
+        content: |
+          {
+            "registry-mirrors": ["https://registry.docker-cn.com", "https://mirror.baidubce.com", "https://hub-mirror.c.163.com"]
+          }
+        dest: /etc/docker/daemon.json
+        mode: '0644'
+
+    - name: 重启Docker服务
+      systemd:
+        name: docker
+        state: restarted
+        enabled: yes
+        daemon_reload: yes
+  when: ansible_os_family in ["Debian", "RedHat"]
+
+- name: 添加当前用户到docker组
+  user:
+    name: "{{ ansible_user }}"
+    groups: docker
+    append: yes
+  when: ansible_os_family in ["Debian", "RedHat"]

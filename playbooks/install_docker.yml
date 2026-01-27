@@ -1,0 +1,136 @@
+---
+# install_docker.yml - 安装Docker Playbook
+# 基于backup目录中的install_docker角色，适配新的目录结构
+
+- hosts: all
+  gather_facts: yes
+  become: true
+
+  vars:
+    # Docker版本配置
+    docker_version: "24.0.6"
+    # Docker数据目录
+    docker_data_dir: /var/lib/docker
+    # Docker存储驱动
+    docker_storage_driver: overlay2
+    # Docker registry镜像源
+    docker_registry_mirrors: 
+      - https://registry.docker-cn.com
+      - https://mirror.baidubce.com
+      - https://hub-mirror.c.163.com
+
+  tasks:
+    - name: 导入Docker安装角色
+      import_role:
+        name: install_docker
+        tasks_from: main.yml
+      when: false  # 暂时禁用旧角色，使用新的安装方式
+
+    - name: 安装Docker依赖包
+      block:
+        - name: 安装Docker依赖包（Ubuntu/Debian）
+          apt:
+            name: 
+              - apt-transport-https
+              - ca-certificates
+              - curl
+              - gnupg-agent
+              - software-properties-common
+            state: present
+            update_cache: yes
+          when: ansible_os_family == "Debian"
+
+        - name: 安装Docker依赖包（CentOS/RHEL）
+          yum:
+            name: 
+              - yum-utils
+              - device-mapper-persistent-data
+              - lvm2
+            state: present
+            update_cache: yes
+          when: ansible_os_family == "RedHat"
+
+    - name: 添加Docker官方GPG密钥
+      apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        state: present
+      when: ansible_os_family == "Debian"
+
+    - name: 添加Docker仓库（Ubuntu/Debian）
+      apt_repository:
+        repo: deb [arch=amd64] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable
+        state: present
+        filename: docker-ce
+      when: ansible_os_family == "Debian"
+
+    - name: 添加Docker仓库（CentOS/RHEL）
+      yum_repository:
+        name: docker-ce-stable
+        description: Docker CE Stable - $basearch
+        baseurl: https://download.docker.com/linux/centos/$releasever/$basearch/stable
+        gpgcheck: yes
+        gpgkey: https://download.docker.com/linux/centos/gpg
+        enabled: yes
+      when: ansible_os_family == "RedHat"
+
+    - name: 安装Docker CE
+      block:
+        - name: 安装Docker CE（Ubuntu/Debian）
+          apt:
+            name: 
+              - docker-ce={{ docker_version }}~3-0~{{ ansible_distribution|lower }}{{ ansible_distribution_version }}
+              - docker-ce-cli={{ docker_version }}~3-0~{{ ansible_distribution|lower }}{{ ansible_distribution_version }}
+              - containerd.io
+            state: present
+            update_cache: yes
+          when: ansible_os_family == "Debian"
+
+        - name: 安装Docker CE（CentOS/RHEL）
+          yum:
+            name: 
+              - docker-ce-{{ docker_version }}
+              - docker-ce-cli-{{ docker_version }}
+              - containerd.io
+            state: present
+          when: ansible_os_family == "RedHat"
+
+    - name: 启动并启用Docker服务
+      service:
+        name: docker
+        state: started
+        enabled: yes
+
+    - name: 创建Docker配置目录
+      file:
+        path: /etc/docker
+        state: directory
+        mode: '0755'
+
+    - name: 配置Docker daemon.json
+      template:
+        src: docker_daemon.json.j2
+        dest: /etc/docker/daemon.json
+        mode: '0644'
+      register: docker_daemon_config
+
+    - name: 重启Docker服务以应用配置
+      service:
+        name: docker
+        state: restarted
+      when: docker_daemon_config.changed
+
+    - name: 添加当前用户到docker组
+      user:
+        name: '{{ ansible_user }}'
+        groups: docker
+        append: yes
+      when: ansible_user != "root"
+
+    - name: 验证Docker安装
+      command: docker --version
+      register: docker_version_check
+      changed_when: false
+
+    - name: 显示Docker版本
+      debug:
+        msg: "Docker安装成功，版本：{{ docker_version_check.stdout }}"

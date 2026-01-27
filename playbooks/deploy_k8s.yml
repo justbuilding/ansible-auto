@@ -1,0 +1,619 @@
+---
+
+
+- name: Kubernetes部署
+  hosts: all
+  become: yes
+  gather_facts: yes
+  vars:
+    # 基础配置
+    k8s_version: "v1.31.9"
+    sealos_version: "v5.1.2-rc3"
+    # 包目录配置
+    pkg_dir: "/tmppkg"
+    # Sealos镜像配置
+    sealos_base_images: 
+      - "registry.cn-shanghai.aliyuncs.com/labring/kubernetes-docker:{{ k8s_version }}"
+      - "registry.cn-shanghai.aliyuncs.com/labring/helm:v3.19.2"
+    sealos_addon_images: 
+      #- "registry.cn-shanghai.aliyuncs.com/labring/openebs:v3.9.0"
+      - "{% if network_plugin == 'calico' %}registry.cn-shanghai.aliyuncs.com/labring/calico:v3.27.4{% elif network_plugin == 'cilium' %}registry.cn-shanghai.aliyuncs.com/labring/cilium:v1.13.4{% endif %}"
+      - "registry.cn-shanghai.aliyuncs.com/labring/minio-operator:v5.0.6"
+      - "registry.cn-shanghai.aliyuncs.com/labring/ingress-nginx:v1.12.1"
+    # 合并所有镜像列表
+    all_images: "{{ sealos_base_images + sealos_addon_images }}"
+    # 节点配置
+    master_hosts: "{{ groups['masters'][0] if 'masters' in groups else inventory_hostname }}"
+    node_hosts: "{{ groups['nodes'] | join(',') if 'nodes' in groups else '' }}"
+    # 系统配置
+    enable_nfs: true
+    enable_docker_data_dir_change: true
+    # 网络插件配置
+    network_plugin: "calico"  # calico or cilium
+    # 架构配置
+    arch: "arm64"  # amd64 or arm64
+    # Sealos安装配置
+    sealos_install_dir: "/usr/sbin"
+    sealos_download_url: "https://github.com/labring/sealos/releases/download/{{ sealos_version }}/sealos_{{ sealos_version | replace('v', '') }}_linux_{{ arch }}.tar.gz"
+
+  tasks:
+    # ===================== 系统初始化 =====================
+
+    - name: 系统初始化
+      block:
+        - name: 在目标服务器上创建/tmppkg目录（如果不存在）
+          file:
+            path: /tmppkg
+            state: directory
+            mode: '0755'
+        
+        # 同步对应架构的包到目标服务器
+        - name: 获取目标服务器的实际架构
+          set_fact:
+            target_arch: "{{ ansible_architecture | replace('aarch64', 'arm64') }}"  # 统一架构名称为arm64
+        
+        - name: 检查本地是否存在对应架构的包目录
+          local_action: stat path="/Users/huangjiajun/Documents/trae_projects/ansible-auto/tmppkg/{{ target_arch }}"
+          become: no
+          register: local_arch_dir_stat
+        
+        - name: 检查本地是否存在arm64包目录
+          local_action: stat path=/Users/huangjiajun/Documents/trae_projects/ansible-auto/tmppkg/arm64
+          become: no
+          register: local_arm64_dir
+        
+        - name: 检查本地是否存在aarch64包目录
+          local_action: stat path=/Users/huangjiajun/Documents/trae_projects/ansible-auto/tmppkg/aarch64
+          become: no
+          register: local_aarch64_dir
+        
+        - name: 检查本地是否存在tmppkg根目录包
+          local_action: stat path=/Users/huangjiajun/Documents/trae_projects/ansible-auto/tmppkg/kubernetes-docker.tar
+          become: no
+          register: local_root_pkg
+          ignore_errors: yes
+        
+        - name: 设置本地架构目录（根据目标服务器架构选择）
+          set_fact:
+            local_arch_dir: "{% if local_aarch64_dir.stat.exists %}/Users/huangjiajun/Documents/trae_projects/ansible-auto/tmppkg/aarch64{% elif local_arm64_dir.stat.exists %}/Users/huangjiajun/Documents/trae_projects/ansible-auto/tmppkg/arm64{% elif local_arch_dir_stat.stat.exists %}/Users/huangjiajun/Documents/trae_projects/ansible-auto/tmppkg/{{ target_arch }}{% elif local_root_pkg.stat.exists %}/Users/huangjiajun/Documents/trae_projects/ansible-auto/tmppkg{% else %}{% endif %}"
+        
+        - name: 显示本地架构目录内容
+          local_action: shell ls -la "{{ local_arch_dir }}"
+          become: no
+          register: local_arch_dir_content
+          when: local_arch_dir != ''
+          ignore_errors: yes
+
+        - name: 显示本地架构目录内容
+          debug:
+            msg: "本地架构目录内容:\n{{ local_arch_dir_content.stdout | default('目录为空') }}"
+          when: local_arch_dir != ''
+
+        - name: 同步对应架构的包到目标服务器
+          synchronize:
+            src: "{{ local_arch_dir }}/"
+            dest: "{{ pkg_dir }}/"
+            recursive: yes
+            mode: push
+            delete: no  # 不删除目标目录中的现有文件
+          when: local_arch_dir != ''
+          register: sync_result
+          ignore_errors: yes  # 允许同步失败，后续任务会处理
+
+        - name: 显示同步结果
+          debug:
+            msg: "包同步结果: {{ '成功' if sync_result is success else '失败，将尝试其他方式' }}"
+          when: local_arch_dir != ''
+
+        - name: 验证目标服务器包目录内容
+          shell: ls -la "{{ pkg_dir }}"
+          register: target_pkg_dir_content
+          when: local_arch_dir != ''
+          ignore_errors: yes
+
+        - name: 显示目标服务器包目录内容
+          debug:
+            msg: "目标服务器包目录内容:\n{{ target_pkg_dir_content.stdout | default('目录为空') }}"
+          when: local_arch_dir != ''
+        
+        # 直接同步本地预下载的Sealos文件到目标服务器
+        - name: 确定要使用的本地Sealos文件名和目标文件名
+          set_fact:
+            local_sealos_file: "{{ '/Users/huangjiajun/Documents/trae_projects/ansible-auto/tmppkg/sealos_5.1.2-rc3_linux_arm64.tar.gz' if (ansible_architecture in ['arm64', 'aarch64']) else '/Users/huangjiajun/Documents/trae_projects/ansible-auto/tmppkg/sealos_5.1.2-rc3_linux_amd64.tar.gz' }}"
+            sealos_filename: "sealos_5.1.2-rc3_linux_{{ 'arm64' if ansible_architecture in ['arm64', 'aarch64'] else 'amd64' }}.tar.gz"
+        
+        - name: 同步本地Sealos文件到目标服务器
+          synchronize:
+            src: "{{ local_sealos_file }}"
+            dest: "{{ pkg_dir }}/{{ sealos_filename }}"
+            mode: push
+        
+        - name: 设置arch变量为目标机器的架构，将aarch64转换为arm64以匹配GitHub发布包
+          set_fact:
+            arch: "{{ ansible_architecture | replace('aarch64', 'arm64') }}"
+        
+        - name: 设置pkg_dir变量为包目录（使用根目录/tmppkg/）
+          set_fact:
+            pkg_dir: /tmppkg
+        
+        - name: 显示最终的arch和pkg_dir设置
+          debug:
+            msg: "最终架构设置: {{ arch }}, 包目录: {{ pkg_dir }}"
+        
+        # 镜像备份机制
+        - name: 检查Docker是否已安装
+          shell: command -v docker > /dev/null 2>&1 || echo "not found"
+          register: docker_installed
+          changed_when: false
+        
+        - name: 创建镜像备份目录
+          file:
+            path: /tmp/docker_images_backup
+            state: directory
+            mode: '0755'
+        
+        # 主机名配置
+        - name: 配置主机名
+          hostname:
+            name: "{{ inventory_hostname }}"
+          register: hostname_result
+          ignore_errors: yes
+        
+        - name: 生成完整的hosts条目内容
+          set_fact:
+            hosts_entries: "{% set entries = [] %}{% for host in groups['all'] %}{% set entries = entries + [hostvars[host]['ansible_default_ipv4']['address'] ~ ' ' ~ host] %}{% endfor %}{{ entries | join('\n') }}"
+
+        - name: 一次性添加所有hosts条目
+          blockinfile:
+            path: /etc/hosts
+            block: |
+              {{ hosts_entries }}
+            marker: "# {mark} ANSIBLE MANAGED BLOCK - ALL HOSTS"
+            state: present
+        
+        # Debian/Ubuntu系统特定任务
+        - name: Debian/Ubuntu系统初始化
+          block:
+            - name: 安装Debian/Ubuntu基础依赖包
+              apt:
+                name: 
+                  - rsync
+                #  - screen
+                #  - wget
+                  - curl
+                #  - vim
+                #  - apt-transport-https
+                #  - ca-certificates
+                #  - gnupg
+                #  - lsb-release
+                state: present
+                update_cache: yes
+              ignore_errors: yes
+
+            - name: 配置apt优化
+              blockinfile:
+                path: /etc/apt/apt.conf.d/99-custom
+                block: |
+                  APT::Acquire::Retries "5";
+                  APT::Acquire::http::Timeout "30";
+                  APT::Acquire::https::Timeout "30";
+                  APT::Get::Assume-Yes "true";
+                  APT::Install-Recommends "false";
+                  APT::Install-Suggests "false";
+                create: yes
+              ignore_errors: yes
+
+            - name: 跳过系统更新（加速部署）
+              debug:
+                msg: "跳过系统更新以加速部署，如需更新请手动执行 apt update && apt upgrade"
+              when: true
+
+            - name: 删除Debian/Ubuntu旧版本Docker相关包
+              apt:
+                name: "{{ item }}"
+                state: absent
+                purge: yes
+              with_items:
+                - "containerd"
+                - "containerd.io"
+                - "docker"
+                - "docker-engine"
+                - "docker.io"
+                - "docker-ce"
+                - "docker-ce-cli"
+                - "docker-compose-plugin"
+              ignore_errors: yes
+
+            - name: 重启Debian/Ubuntu网络服务
+              service:
+                name: systemd-networkd
+                state: restarted
+                enabled: yes
+          when: ansible_os_family == "Debian"
+
+        # CentOS/RHEL系统特定任务
+        - name: CentOS/RHEL系统初始化
+          block:
+            - name: 安装CentOS/RHEL基础依赖包
+              yum:
+                name: 
+                  - yum-utils
+                  - device-mapper-persistent-data
+                  - lvm2
+                  - socat
+                  - nfs-utils
+                  - nfs-utils-lib
+                  - rsync
+                #  - screen
+                #  - wget
+                  - curl
+                #  - vim
+                state: present
+                update_cache: yes
+              ignore_errors: yes
+
+            - name: 更新CentOS/RHEL系统（排除内核）
+              yum:
+                name: "*"
+                state: latest
+                exclude: "kernel*"
+              ignore_errors: yes
+
+            - name: 删除CentOS/RHEL旧版本Docker相关包
+              yum:
+                name: "{{ item }}"
+                state: absent
+              with_items:
+                - "container*"
+                - "docker*"
+              ignore_errors: yes
+
+            - name: 重启CentOS/RHEL NetworkManager服务
+              service:
+                name: NetworkManager
+                state: restarted
+                enabled: yes
+          when: ansible_os_family == "RedHat"
+
+    # ===================== Sealos安装 =====================
+
+    - name: Sealos安装
+      block:
+        - name: 检查Sealos二进制文件是否已存在
+          stat:
+            path: "{{ sealos_install_dir }}/sealos"
+          register: sealos_binary
+
+        - name: 如果Sealos二进制文件不存在，则安装（使用本地预下载文件）
+          block:
+            - name: 设置Sealos下载文件名
+              set_fact:
+                sealos_filename: "sealos_{{ sealos_version | replace('v', '') }}_linux_{{ arch }}.tar.gz"
+
+            - name: 检查pkg_dir中的Sealos文件是否存在（统一目录）
+              stat:
+                path: "{{ pkg_dir }}/{{ sealos_filename }}"
+              register: sealos_pkg_file
+
+            - name: 解压Sealos到指定目录
+              unarchive:
+                src: "{{ pkg_dir }}/{{ sealos_filename }}"
+                dest: "{{ sealos_install_dir }}"
+                remote_src: yes
+              when: sealos_pkg_file.stat.exists
+          when: not sealos_binary.stat.exists
+
+        - name: 验证Sealos安装（静默模式）
+          command: "sealos version"
+          register: sealos_version_output
+          changed_when: false
+          when: sealos_binary.stat.exists
+
+    # ===================== 镜像管理 =====================
+    - name: 镜像管理（只在master节点执行）
+      when: inventory_hostname == master_hosts
+      block:
+        - name: 创建包目录
+          file:
+            path: "{{ pkg_dir }}"
+            state: directory
+            mode: '0755'
+        
+        - name: 检查sealos命令是否可用
+          command: which sealos
+          register: sealos_path
+          ignore_errors: yes
+          changed_when: false
+
+        - name: 检查并下载所有镜像
+          block:
+            - name: 仅在需要时下载并保存镜像（跳过已存在的镜像包）
+              shell: |
+                # 显示当前目录和包目录内容
+                echo "当前工作目录: $(pwd)"
+                echo "包目录内容:"
+                ls -la {{ pkg_dir }}/
+                
+                # 检查是否已存在kubernetes.tar等基本镜像包
+                if [ -f "{{ pkg_dir }}/kubernetes.tar" ]; then
+                  echo "已存在kubernetes.tar镜像包，跳过下载"
+                  exit 0
+                fi
+                
+                # 检查是否已存在基本镜像包
+                {% if network_plugin == 'calico' %}
+                docker_packages=("{{ pkg_dir }}/kubernetes-docker.tar" "{{ pkg_dir }}/helm.tar" "{{ pkg_dir }}/calico.tar" "{{ pkg_dir }}/ingress-nginx.tar" "{{ pkg_dir }}/minio-operator.tar")
+                {% elif network_plugin == 'cilium' %}
+                docker_packages=("{{ pkg_dir }}/kubernetes-docker.tar" "{{ pkg_dir }}/helm.tar" "{{ pkg_dir }}/cilium.tar" "{{ pkg_dir }}/ingress-nginx.tar" "{{ pkg_dir }}/minio-operator.tar")
+                {% endif %}
+                docker_packages_found=0
+                for pkg in "${docker_packages[@]}"; do
+                  if [ -f "$pkg" ]; then
+                    echo "找到镜像包: $pkg"
+                    docker_packages_found=$((docker_packages_found + 1))
+                  fi
+                done
+                
+                if [ $docker_packages_found -ge 2 ]; then
+                  echo "已存在足够的镜像包（找到$docker_packages_found个），跳过下载"
+                  exit 0
+                fi
+                
+                # 检查是否已存在其他格式的镜像包
+                other_packages=("{{ pkg_dir }}/registry_*.tar" "{{ pkg_dir }}/*_metrics-server_*.tar" "{{ pkg_dir }}/metrics-server_*.tar")
+                has_other_packages=false
+                for pattern in "${other_packages[@]}"; do
+                  pkg_count=$(ls $pattern 2>/dev/null | wc -l)
+                  if [ $pkg_count -gt 0 ]; then
+                    echo "找到其他格式镜像包: $(ls $pattern 2>/dev/null)"
+                    has_other_packages=true
+                    break
+                  fi
+                done
+                
+                if [ "$has_other_packages" = true ]; then
+                  echo "已存在其他格式的镜像包，跳过下载"
+                  exit 0
+                fi
+                
+                echo "没有找到足够的镜像包，开始下载"
+                # 定义镜像和对应的文件名映射
+                declare -A image_map
+                image_map["registry.cn-shanghai.aliyuncs.com/labring/kubernetes-docker:{{ k8s_version }}"]="kubernetes-docker.tar"
+                image_map["registry.cn-shanghai.aliyuncs.com/labring/helm:v3.19.2"]="helm.tar"
+                {% if network_plugin == 'calico' %}
+                image_map["registry.cn-shanghai.aliyuncs.com/labring/calico:v3.27.4"]="calico.tar"
+                {% elif network_plugin == 'cilium' %}
+                image_map["registry.cn-shanghai.aliyuncs.com/labring/cilium:v1.13.4"]="cilium.tar"
+                {% endif %}
+                image_map["registry.cn-shanghai.aliyuncs.com/labring/minio-operator:v5.0.6"]="minio-operator.tar"
+                image_map["registry.cn-shanghai.aliyuncs.com/labring/ingress-nginx:v1.12.1"]="ingress-nginx.tar"
+                
+                # 只下载不存在的镜像
+                download_count=0
+                {% if network_plugin == 'calico' %}
+                for image in registry.cn-shanghai.aliyuncs.com/labring/kubernetes-docker:{{ k8s_version }} registry.cn-shanghai.aliyuncs.com/labring/helm:v3.19.2 registry.cn-shanghai.aliyuncs.com/labring/calico:v3.27.4 registry.cn-shanghai.aliyuncs.com/labring/minio-operator:v5.0.6 registry.cn-shanghai.aliyuncs.com/labring/ingress-nginx:v1.12.1; do
+                {% elif network_plugin == 'cilium' %}
+                for image in registry.cn-shanghai.aliyuncs.com/labring/kubernetes-docker:{{ k8s_version }} registry.cn-shanghai.aliyuncs.com/labring/helm:v3.19.2 registry.cn-shanghai.aliyuncs.com/labring/cilium:v1.13.4 registry.cn-shanghai.aliyuncs.com/labring/minio-operator:v5.0.6 registry.cn-shanghai.aliyuncs.com/labring/ingress-nginx:v1.12.1; do
+                {% endif %}
+                  filename="${image_map[$image]}"
+                  if [ ! -f "{{ pkg_dir }}/$filename" ]; then
+                    echo "下载镜像: $image"
+                    sealos pull "$image" || echo "Warning: 拉取镜像 $image 失败，继续处理其他镜像"
+                    echo "保存镜像到: {{ pkg_dir }}/$filename"
+                    sealos save -o "{{ pkg_dir }}/$filename" "$image" || echo "Warning: 保存镜像 $image 失败，继续处理其他镜像"
+                    download_count=$((download_count + 1))
+                  fi
+                done
+                
+                echo "镜像下载完成，共下载了$download_count个镜像包"
+              args:
+                executable: /bin/bash
+              register: image_download_result
+              changed_when: "'下载镜像' in image_download_result.stdout"
+              ignore_errors: yes  # 允许部分镜像下载失败，继续执行
+          when: sealos_path.rc == 0  # 只有在sealos命令可用时才执行
+        
+        - name: 加载本地镜像（如果存在）
+          shell: |
+            # 初始化加载状态
+            loaded=false
+            
+            # 1. 优先加载kubernetes.tar及相关镜像包
+            if [ -f "{{ pkg_dir }}/kubernetes.tar" ]; then
+              echo "找到kubernetes.tar，开始加载镜像包"
+              {% if network_plugin == 'calico' %}
+              sealos load -i "{{ pkg_dir }}/kubernetes.tar" "{{ pkg_dir }}/helm.tar" "{{ pkg_dir }}/calico.tar" "{{ pkg_dir }}/ingress-nginx.tar" "{{ pkg_dir }}/minio-operator.tar"
+              {% elif network_plugin == 'cilium' %}
+              sealos load -i "{{ pkg_dir }}/kubernetes.tar" "{{ pkg_dir }}/helm.tar" "{{ pkg_dir }}/cilium.tar" "{{ pkg_dir }}/ingress-nginx.tar" "{{ pkg_dir }}/minio-operator.tar"
+              {% endif %}
+              echo "kubernetes.tar及相关镜像包加载完成"
+              loaded=true
+            fi
+            
+            # 2. 加载其他格式的镜像包（如registry_*.tar、metrics-server_*.tar等）
+            other_packages=("{{ pkg_dir }}/registry_*.tar" "{{ pkg_dir }}/*_metrics-server_*.tar" "{{ pkg_dir }}/metrics-server_*.tar")
+            for pattern in "${other_packages[@]}"; do
+              for pkg in $pattern; do
+                if [ -f "$pkg" ]; then
+                  echo "加载镜像包: $pkg"
+                  sealos load -i "$pkg"
+                  loaded=true
+                fi
+              done
+            done
+            
+            # 3. 加载单独命名的镜像包
+            packages=("kubernetes-docker.tar" "helm.tar" "{{ 'calico' if network_plugin == 'calico' else 'cilium' }}.tar" "minio-operator.tar" "ingress-nginx.tar")
+            for pkg in "${packages[@]}"; do
+              if [ -f "{{ pkg_dir }}/$pkg" ]; then
+                echo "加载镜像包: $pkg"
+                sealos load -i "{{ pkg_dir }}/$pkg"
+                loaded=true
+              fi
+            done
+            
+            # 4. 检查加载结果
+            if [ "$loaded" = true ]; then
+              echo "所有镜像包加载完成"
+            else
+              echo "没有找到镜像包，将直接从网络拉取"
+            fi
+          args:
+            executable: /bin/bash
+          register: image_load_result
+          changed_when: "'加载镜像包' in image_load_result.stdout or '找到kubernetes.tar' in image_load_result.stdout"
+
+    # ===================== Master节点部署 =====================
+
+    - name: Master节点部署Kubernetes
+      when: inventory_hostname == master_hosts
+      block:
+        - name: 生成Sealos基础镜像部署命令
+          set_fact:
+            sealos_base_run_cmd: "sealos run {{ sealos_base_images | join(' ') }} --masters {{ hostvars[master_hosts].ansible_default_ipv4.address }} {{ '--nodes ' + node_hosts if node_hosts != '' else '' }} --force"
+
+        - name: 执行Sealos基础镜像部署命令
+          command: "{{ sealos_base_run_cmd }}"
+          register: sealos_base_deploy_result
+          changed_when: sealos_base_deploy_result.rc == 0
+          environment:
+            SEALOS_FORCE: "true"
+
+        - name: 显示基础镜像部署结果
+          debug:
+            msg: "Kubernetes基础镜像部署{{ '成功' if sealos_base_deploy_result.rc == 0 else '失败' }}"
+
+        # 一步一步部署addon组件
+        - name: 部署网络插件
+          command: "bash -c 'echo master1|sealos run {% if network_plugin == 'calico' %}registry.cn-shanghai.aliyuncs.com/labring/calico:v3.27.4{% elif network_plugin == 'cilium' %}registry.cn-shanghai.aliyuncs.com/labring/cilium:v1.13.4{% endif %} --force'"
+          register: sealos_network_deploy_result
+          changed_when: sealos_network_deploy_result.rc == 0
+          environment:
+            SEALOS_FORCE: "true"
+          ignore_errors: yes
+
+        - name: 显示网络插件部署结果
+          debug:
+            msg: "{{ network_plugin }}网络插件部署{{ '成功' if sealos_network_deploy_result.rc == 0 else '失败' }}"
+            
+        - name: 等待基础组件就绪
+          command: "kubectl wait --for=condition=ready pod --all -n kube-system --timeout=3s"
+          register: kube_base_ready
+          retries: 1
+          delay: 1
+          ignore_errors: yes
+
+        - name: 显示Kubernetes组件状态（基础部署后）
+          command: "kubectl get nodes"
+          register: kube_nodes_status
+          changed_when: false
+
+        - name: 显示节点状态（基础部署后）
+          debug:
+            msg: "Kubernetes节点状态: {{ kube_nodes_status.stdout }}"
+
+
+        - name: 部署minio-operator
+          command: "sealos run registry.cn-shanghai.aliyuncs.com/labring/minio-operator:v5.0.6 --force"
+          register: sealos_minio_deploy_result
+          changed_when: sealos_minio_deploy_result.rc == 0
+          environment:
+            SEALOS_FORCE: "true"
+          ignore_errors: yes
+
+        - name: 显示minio-operator部署结果
+          debug:
+            msg: "minio-operator部署{{ '成功' if sealos_minio_deploy_result.rc == 0 else '失败' }}"
+
+        - name: 部署ingress-nginx
+          command: "sealos run registry.cn-shanghai.aliyuncs.com/labring/ingress-nginx:v1.12.1 --force"
+          register: sealos_ingress_deploy_result
+          changed_when: sealos_ingress_deploy_result.rc == 0
+          environment:
+            SEALOS_FORCE: "true"
+          ignore_errors: yes
+
+        - name: 显示ingress-nginx部署结果
+          debug:
+            msg: "ingress-nginx部署{{ '成功' if sealos_ingress_deploy_result.rc == 0 else '失败' }}"
+
+        - name: 快速检查核心组件就绪状态
+          command: "kubectl wait --for=condition=ready pod --all -n kube-system --timeout=5s"
+          register: kube_system_ready
+          ignore_errors: yes
+
+        - name: 检查网络插件就绪状态
+          command: "kubectl wait --for=condition=ready pod --all -n {{ 'calico-system' if network_plugin == 'calico' else 'cilium-system' }} --timeout=5s"
+          register: network_plugin_ready
+          ignore_errors: yes
+
+        - name: 检查ingress组件就绪状态
+          command: "kubectl wait --for=condition=ready pod --all -n ingress-nginx --timeout=5s"
+          register: ingress_ready
+          ignore_errors: yes
+
+        - name: 检查minio组件就绪状态
+          command: "kubectl wait --for=condition=ready pod --all -n minio-operator --timeout=5s"
+          register: minio_ready
+          ignore_errors: yes
+
+        - name: 显示最终Kubernetes集群状态
+          command: "kubectl get nodes -o wide"
+          register: final_nodes_status
+          changed_when: false
+          ignore_errors: yes
+
+        - name: 显示最终节点状态
+          debug:
+            msg: "最终Kubernetes节点状态: {{ final_nodes_status.stdout | default('无法获取节点状态') }}"
+
+        - name: 显示所有命名空间中的Pod状态
+          command: "kubectl get pods -A"
+          register: final_pods_status
+          changed_when: false
+          ignore_errors: yes
+
+        - name: 显示最终Pod状态
+          debug:
+            msg: |
+              ==============================================================
+              最终Pod状态
+              ==============================================================
+              {{ final_pods_status.stdout | default('无法获取Pod状态') }}
+              ==============================================================
+
+
+
+    # ===================== 配置清理 =====================
+    - name: 配置清理
+      block:
+        - name: 删除旧的镜像包目录（如果存在）
+          file:
+            path: /tmp/sealos_images
+            state: absent
+          ignore_errors: yes
+          when: delete_old_images | default(false)
+
+        - name: 删除旧的Sealos二进制目录（如果存在）
+          file:
+            path: /tmp/sealos
+            state: absent
+          ignore_errors: yes
+          when: delete_old_sealos | default(false)
+
+
+
+
+  handlers:
+    - name: restart docker
+      systemd:
+        name: docker
+        state: restarted
+        daemon_reload: yes
+
+    - name: restart networkmanager
+      systemd:
+        name: NetworkManager
+        state: restarted
+        enabled: yes
