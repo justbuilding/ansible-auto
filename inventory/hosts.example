@@ -1,0 +1,39 @@
+# Kubernetes集群主机清单示例
+# 支持master节点安装和node节点灵活添加
+
+# Master节点配置
+[masters]
+master1 ansible_host=192.168.1.163 ansible_user=root
+
+# Node节点配置（可选，可根据需要添加或删除）
+[nodes]
+node1 ansible_host=192.168.1.73 ansible_user=root
+node2 ansible_host=192.168.1.74 ansible_user=root
+node3 ansible_host=192.168.1.76 ansible_user=root
+
+# 单机部署示例（仅master节点，无需nodes组）
+# [all]
+# master1 ansible_host=192.168.1.163 ansible_user=root
+
+# 变量配置
+[all:vars]
+# SSH连接配置
+ansible_ssh_common_args='-o StrictHostKeyChecking=no'
+
+# Kubernetes版本配置
+k8s_version=v1.31.9
+
+# Sealos版本配置
+sealos_version=v5.1.2-rc3
+
+# Docker数据目录
+docker_data_dir=/data/docker
+
+# 架构配置（amd64或arm64）
+arch=arm64
+
+# 是否修改Docker数据目录
+enable_docker_data_dir_change=true
+
+# 是否安装NFS相关包
+enable_nfs=true
