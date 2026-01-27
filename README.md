@@ -39,6 +39,10 @@ ansible-auto/
 │       ├── tasks/           # 任务文件
 │       └── defaults/        # 默认变量
 ├── scripts/                 # 脚本目录
+├── tmppkg/                  # 临时包目录（包含镜像包和下载脚本）
+│   ├── amd64/               # AMD64架构镜像包
+│   ├── arm64/               # ARM64架构镜像包
+│   └── aarch64/             # ARM64架构镜像包（兼容别名）
 ├── ansible.cfg              # Ansible配置文件
 ├── ansible.log              # Ansible日志文件
 └── README.md                # 项目说明文档
@@ -102,6 +106,8 @@ ansible-auto/
   - 详细的环境检查结果和清理建议
   - 支持多种格式镜像包（sealos_hub_5000_*.tar、registry_*.tar、metrics-server_*.tar等）
   - Docker配置分离，支持部署后自定义配置
+  - 网络插件选择（Calico/Cilium）
+  - 版本一致性保证，所有组件使用指定版本
 
 ### 6. 环境重置
 - **Playbook**: `playbooks/reset_environment.yml`
@@ -349,9 +355,27 @@ ansible-playbook playbooks/reset_environment.yml
 | kubernetes-docker | v1.31.9 | registry.cn-shanghai.aliyuncs.com/labring/kubernetes-docker |
 | helm | v3.19.2 | registry.cn-shanghai.aliyuncs.com/labring/helm |
 | calico | v3.27.4 | registry.cn-shanghai.aliyuncs.com/labring/calico |
-| cilium | v1.18.5 | registry.cn-shanghai.aliyuncs.com/labring/cilium |
+| cilium | v1.13.4 | registry.cn-shanghai.aliyuncs.com/labring/cilium |
 | ingress-nginx | v1.12.1 | registry.cn-shanghai.aliyuncs.com/labring/ingress-nginx |
 | minio-operator | v5.0.6 | registry.cn-shanghai.aliyuncs.com/labring/minio-operator |
+
+#### 网络插件选择
+
+项目支持两种网络插件，可通过 `network_plugin` 变量选择：
+
+| 网络插件 | 变量值 | 版本 | 特点 |
+|---------|-------|------|------|
+| Calico | `calico` | v3.27.4 | 稳定可靠，广泛使用 |
+| Cilium | `cilium` | v1.13.4 | 基于eBPF，性能优异 |
+
+**使用方法**：
+```bash
+# 使用Calico网络插件（默认）
+ansible-playbook playbooks/deploy_k8s.yml
+
+# 使用Cilium网络插件
+ansible-playbook playbooks/deploy_k8s.yml -e "network_plugin=cilium"
+```
 
 ## 最佳实践
 
@@ -457,7 +481,7 @@ file /path/to/ansible-auto/tmppkg/arm64/sealos_hub_5000_*.tar
   - registry.cn-shanghai.aliyuncs.com/labring/kubernetes-docker:v1.31.9
   - registry.cn-shanghai.aliyuncs.com/labring/helm:v3.19.2
   - registry.cn-shanghai.aliyuncs.com/labring/calico:v3.27.4
-  - registry.cn-shanghai.aliyuncs.com/labring/cilium:v1.18.5
+  - registry.cn-shanghai.aliyuncs.com/labring/cilium:v1.13.4
   - registry.cn-shanghai.aliyuncs.com/labring/ingress-nginx:v1.12.1
   - registry.cn-shanghai.aliyuncs.com/labring/minio-operator:v5.0.6
 
