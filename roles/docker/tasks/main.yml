@@ -1,0 +1,94 @@
+---
+# Docker安装和配置
+
+- name: 检查Docker是否已安装
+  shell: 'which docker'
+  register: docker_installed
+  ignore_errors: yes
+
+- name: 安装必要的依赖包
+  apt:
+    name:
+      - apt-transport-https
+      - ca-certificates
+      - curl
+      - gnupg
+      - lsb-release
+    state: present
+    update_cache: yes
+  when: ansible_facts['os_family'] == 'Debian' and docker_installed.rc != 0
+
+- name: 安装必要的依赖包 (CentOS/RHEL)
+  yum:
+    name:
+      - yum-utils
+      - device-mapper-persistent-data
+      - lvm2
+    state: present
+    update_cache: yes
+  when: ansible_facts['os_family'] == 'RedHat' and docker_installed.rc != 0
+
+- name: 添加Docker GPG密钥 (Debian)
+  apt_key:
+    url: https://download.docker.com/linux/{{ ansible_facts['distribution'] | lower }}/gpg
+    state: present
+  when: ansible_facts['os_family'] == 'Debian' and docker_installed.rc != 0
+
+- name: 添加Docker仓库 (Debian)
+  apt_repository:
+    repo: deb [arch={{ ansible_facts['architecture'] }}] https://download.docker.com/linux/{{ ansible_facts['distribution'] | lower }} {{ ansible_facts['distribution_release'] }} stable
+    state: present
+  when: ansible_facts['os_family'] == 'Debian' and docker_installed.rc != 0
+
+- name: 添加Docker仓库 (CentOS/RHEL)
+  yum_repository:
+    name: docker-ce
+    description: Docker CE Stable - $basearch
+    baseurl: https://download.docker.com/linux/centos/$releasever/$basearch/stable
+    gpgcheck: yes
+    gpgkey: https://download.docker.com/linux/centos/gpg
+    enabled: yes
+  when: ansible_facts['os_family'] == 'RedHat' and docker_installed.rc != 0
+
+- name: 安装Docker（仅当未安装时）
+  package:
+    name:
+      - docker-ce
+      - docker-ce-cli
+      - containerd.io
+    state: present
+  when: docker_installed.rc != 0
+
+- name: 创建Docker配置目录
+  file:
+    path: /etc/docker
+    state: directory
+    mode: '0755'
+
+- name: 配置Docker daemon
+  template:
+    src: docker_daemon.json.j2
+    dest: /etc/docker/daemon.json
+    mode: '0644'
+  notify: restart docker
+
+- name: 启动并启用Docker服务
+  systemd:
+    name: docker
+    state: started
+    enabled: yes
+
+- name: 添加当前用户到docker组
+  user:
+    name: "{{ ansible_user }}"
+    groups: docker
+    append: yes
+
+- name: 验证Docker安装
+  command: docker --version
+  register: docker_version
+  changed_when: false
+
+- name: 显示Docker版本
+  debug:
+    msg: "Docker已成功安装，版本: {{ docker_version.stdout }}"

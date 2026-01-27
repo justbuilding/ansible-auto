@@ -1,0 +1,11 @@
+#!/bin/bash
+# Ansible managed: {{ ansible_date_time.iso8601 }}
+
+# 加载IPVS模块
+ipvs_modules="ip_vs ip_vs_rr ip_vs_wrr ip_vs_sh nf_conntrack"
+
+for module in $ipvs_modules; do
+    if ! lsmod | grep -q $module; then
+        modprobe $module
+    fi
+done

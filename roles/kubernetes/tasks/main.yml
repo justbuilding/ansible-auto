@@ -1,0 +1,141 @@
+---
+# Kubernetes部署和管理
+
+- name: 检查是否已安装kubernetes相关组件
+  shell: 'which kubeadm || which kubectl || which kubelet || which sealos || which k3s || which rke2'
+  register: k8s_components
+  ignore_errors: yes
+
+- name: 检查是否存在旧的kubernetes配置
+  stat:
+    path: /etc/kubernetes
+  register: k8s_config
+
+- name: 检查是否存在旧的k3s配置
+  stat:
+    path: /etc/rancher/k3s
+  register: k3s_config
+
+- name: 检查是否存在旧的rke2配置
+  stat:
+    path: /etc/rancher/rke2
+  register: rke2_config
+
+- name: 检查是否存在旧的docker容器
+  shell: 'docker ps -a | grep -E "k8s_|kubernetes|rancher|cattle" | wc -l'
+  register: k8s_containers
+  ignore_errors: yes
+
+- name: 检查是否存在旧的网络配置
+  stat:
+    path: /etc/cni
+  register: cni_config
+
+- name: 检查是否存在旧的存储配置
+  stat:
+    path: /var/lib/etcd
+  register: etcd_config
+
+- name: 检查是否存在旧的kubelet配置
+  stat:
+    path: /var/lib/kubelet
+  register: kubelet_config
+
+- name: 显示环境检查结果
+  debug:
+    msg: |
+      ============================================
+      环境检查结果:
+      ============================================
+      已安装的Kubernetes组件: {{ k8s_components.stdout | default('无') }}
+      Kubernetes配置目录: {{ k8s_config.stat.exists | ternary('存在', '不存在') }}
+      K3s配置目录: {{ k3s_config.stat.exists | ternary('存在', '不存在') }}
+      RKE2配置目录: {{ rke2_config.stat.exists | ternary('存在', '不存在') }}
+      旧的Kubernetes容器: {{ k8s_containers.stdout | default('0') }}个
+      CNI网络配置目录: {{ cni_config.stat.exists | ternary('存在', '不存在') }}
+      etcd存储目录: {{ etcd_config.stat.exists | ternary('存在', '不存在') }}
+      kubelet数据目录: {{ kubelet_config.stat.exists | ternary('存在', '不存在') }}
+      ============================================
+      警告: 请确保在干净的环境中部署Kubernetes!
+      如果存在旧的Kubernetes组件或配置，请先清理后再部署。
+      清理建议:
+      1. 卸载旧的Kubernetes组件
+      2. 删除旧的配置目录
+      3. 清理旧的Docker容器
+      4. 重启系统以确保网络和存储配置完全清理
+      ============================================
+
+- name: 下载并安装Sealos
+  shell: |
+    curl -sfL https://github.com/labring/sealos/releases/download/v5.1.2-rc3/sealos_5.1.2-rc3_linux_arm64.tar.gz -o sealos.tar.gz
+    tar -zxvf sealos.tar.gz sealos
+    chmod +x sealos
+    mv sealos /usr/local/bin/
+    rm -f sealos.tar.gz
+  when: "'sealos' not in k8s_components.stdout"
+
+- name: 拉取Kubernetes镜像（在线模式）
+  shell: |
+    sealos pull registry.cn-shanghai.aliyuncs.com/labring/kubernetes-docker:v1.31.9
+    sealos pull registry.cn-shanghai.aliyuncs.com/labring/helm:v3.19.2
+    {% if network_plugin == 'calico' %}
+    sealos pull registry.cn-shanghai.aliyuncs.com/labring/calico:v3.27.4
+    {% elif network_plugin == 'cilium' %}
+    sealos pull registry.cn-shanghai.aliyuncs.com/labring/cilium:v1.18.5
+    {% endif %}
+    sealos pull registry.cn-shanghai.aliyuncs.com/labring/ingress-nginx:v1.12.1
+    sealos pull registry.cn-shanghai.aliyuncs.com/labring/minio-operator:v5.0.6
+  when: "'sealos' in k8s_components.stdout or 'sealos' not in k8s_components.stdout"
+
+- name: 初始化Kubernetes集群（master节点）
+  shell: |
+    sealos run registry.cn-shanghai.aliyuncs.com/labring/kubernetes-docker:v1.31.9 registry.cn-shanghai.aliyuncs.com/labring/helm:v3.19.2 {% if network_plugin == 'calico' %}registry.cn-shanghai.aliyuncs.com/labring/calico:v3.27.4{% elif network_plugin == 'cilium' %}registry.cn-shanghai.aliyuncs.com/labring/cilium:v1.18.5{% endif %} registry.cn-shanghai.aliyuncs.com/labring/ingress-nginx:v1.12.1 registry.cn-shanghai.aliyuncs.com/labring/minio-operator:v5.0.6 \n  
+      --master {{ inventory_hostname }} \n  
+      --node {{ groups['nodes'] | join(' ') }} \n  
+      --podcidr 10.244.0.0/16 \n  
+      --svccidr 10.96.0.0/12 \n  
+      --interface {{ ansible_default_ipv4.interface }}
+  when: inventory_hostname in groups['masters']
+
+- name: 等待Kubernetes集群初始化完成
+  shell: kubectl get nodes
+  register: kubectl_result
+  retries: 30
+  delay: 10
+  until: kubectl_result.rc == 0
+  when: inventory_hostname in groups['masters']
+
+- name: 配置kubectl命令自动补全
+  shell: |
+    echo 'source <(kubectl completion bash)' >> ~/.bashrc
+    kubectl completion bash > /etc/bash_completion.d/kubectl
+  when: inventory_hostname in groups['masters']
+
+- name: 复制kubectl配置到普通用户
+  shell: |
+    mkdir -p ~/.kube
+    cp /etc/kubernetes/admin.conf ~/.kube/config
+    chown $(id -u):$(id -g) ~/.kube/config
+  when: inventory_hostname in groups['masters']
+
+- name: 显示Kubernetes集群状态
+  shell: kubectl cluster-info
+  register: cluster_info
+  when: inventory_hostname in groups['masters']
+
+- name: 显示集群节点状态
+  shell: kubectl get nodes
+  register: nodes_status
+  when: inventory_hostname in groups['masters']
+
+- name: 输出集群信息
+  debug:
+    msg: |
+      ============================================
+      Kubernetes集群部署完成!
+      ============================================
+      {{ cluster_info.stdout }}
+      ============================================
+      {{ nodes_status.stdout }}
+      ============================================
+  when: inventory_hostname in groups['masters']

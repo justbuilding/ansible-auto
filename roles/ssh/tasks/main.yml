@@ -1,0 +1,52 @@
+---
+# SSH密钥设置和免密登录配置
+
+- name: 检查~/.ssh目录是否存在
+  stat:
+    path: "{{ ansible_env.HOME }}/.ssh"
+  register: ssh_dir
+
+- name: 创建~/.ssh目录
+  file:
+    path: "{{ ansible_env.HOME }}/.ssh"
+    state: directory
+    mode: '0700'
+  when: not ssh_dir.stat.exists
+
+- name: 检查是否存在SSH密钥对
+  stat:
+    path: "{{ ansible_env.HOME }}/.ssh/id_rsa"
+  register: ssh_key
+
+- name: 生成SSH密钥对
+  command: ssh-keygen -t rsa -b 4096 -f "{{ ansible_env.HOME }}/.ssh/id_rsa" -N ""
+  when: not ssh_key.stat.exists
+
+- name: 读取公钥内容
+  slurp:
+    src: "{{ ansible_env.HOME }}/.ssh/id_rsa.pub"
+  register: public_key
+
+- name: 确保目标主机的~/.ssh目录存在
+  file:
+    path: "~/.ssh"
+    state: directory
+    mode: '0700'
+  delegate_to: "{{ item }}"
+  with_items: "{{ groups['all'] }}"
+
+- name: 将公钥添加到目标主机的authorized_keys
+  authorized_key:
+    user: "{{ ansible_user }}"
+    key: "{{ public_key.content | b64decode }}"
+    state: present
+  delegate_to: "{{ item }}"
+  with_items: "{{ groups['all'] }}"
+
+- name: 测试SSH连接
+  wait_for:
+    host: "{{ item }}"
+    port: 22
+    timeout: 5
+  delegate_to: localhost
+  with_items: "{{ groups['all'] }}"

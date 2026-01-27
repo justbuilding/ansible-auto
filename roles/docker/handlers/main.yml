@@ -1,0 +1,9 @@
+---
+# Docker服务处理
+
+- name: restart docker
+  systemd:
+    name: docker
+    state: restarted
+    enabled: yes
+    daemon_reload: yes
