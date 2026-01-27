@@ -1,0 +1,80 @@
+---
+
+- name: 部署Metrics Server
+  hosts: all
+  become: yes
+  gather_facts: yes
+  vars:
+    # Metrics Server配置
+    metrics_server_yaml: "{{ playbook_dir }}/../yaml/metrics-high-availability-1.21+.yaml"
+    metrics_server_namespace: "kube-system"
+    metrics_server_deployment: "metrics-server"
+
+  tasks:
+    # ===================== 前置检查 =====================
+    - name: 检查Kubernetes集群是否可用
+      command: "kubectl cluster-info"
+      register: kube_cluster_info
+      changed_when: false
+      ignore_errors: yes
+
+    - name: 验证Kubernetes集群状态
+      assert:
+        that:
+          - kube_cluster_info.rc == 0
+        fail_msg: "Kubernetes集群不可用，请先部署Kubernetes集群"
+        success_msg: "Kubernetes集群状态正常"
+
+    # ===================== 部署Metrics Server =====================
+    - name: 部署Metrics Server
+      command: "kubectl apply -f {{ metrics_server_yaml }}"
+      register: metrics_deploy_result
+      changed_when: "'created' in metrics_deploy_result.stdout or 'configured' in metrics_deploy_result.stdout"
+      environment:
+        KUBECONFIG: "{{ lookup('env', 'KUBECONFIG') | default('/etc/kubernetes/admin.conf', true) }}"
+
+    - name: 显示部署结果
+      debug:
+        msg: "Metrics Server部署{{ '成功' if metrics_deploy_result.rc == 0 else '失败' }}"
+
+    # ===================== 验证部署 =====================
+    - name: 等待Metrics Server Pod就绪
+      command: "kubectl wait --for=condition=ready pod -l k8s-app=metrics-server -n {{ metrics_server_namespace }} --timeout=30s"
+      register: metrics_pod_ready
+      changed_when: false
+      ignore_errors: yes
+
+    - name: 检查Metrics Server部署状态
+      command: "kubectl get deployment {{ metrics_server_deployment }} -n {{ metrics_server_namespace }}"
+      register: metrics_deployment_status
+      changed_when: false
+
+    - name: 显示Metrics Server状态
+      debug:
+        msg: "{{ metrics_deployment_status.stdout }}"
+
+    - name: 验证Metrics Server API是否可用
+      command: "kubectl get --raw /apis/metrics.k8s.io/v1beta1/nodes"
+      register: metrics_api_check
+      changed_when: false
+      ignore_errors: yes
+
+    - name: 显示Metrics API检查结果
+      debug:
+        msg: "Metrics Server API {{ '可用' if metrics_api_check.rc == 0 else '不可用' }}"
+
+    # ===================== 部署完成 =====================
+    - name: 部署完成信息
+      debug:
+        msg: |
+          ==============================================================
+          Metrics Server部署完成
+          ==============================================================
+          部署状态: {{ '成功' if metrics_deploy_result.rc == 0 else '失败' }}
+          Pod就绪状态: {{ '就绪' if metrics_pod_ready.rc == 0 else '未就绪' }}
+          API可用性: {{ '可用' if metrics_api_check.rc == 0 else '不可用' }}
+          ==============================================================
+          提示:
+          - 可以使用 'kubectl top nodes' 和 'kubectl top pods' 命令验证Metrics Server功能
+          - 首次使用可能需要等待几分钟数据收集
+          ==============================================================
