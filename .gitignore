@@ -12,9 +12,18 @@
 .trae/
 
 # 临时目录和文件
-/tmppkg/
 tmp/
 temp/
+
+# 忽略tmppkg目录下的压缩包文件，但保留目录结构和脚本
+/tmppkg/**/*.tar
+/tmppkg/**/*.tar.gz
+/tmppkg/**/*.tgz
+/tmppkg/**/*.zip
+
+# 保留tmppkg目录下的脚本文件
+!**/save.sh
+!**/down.sh
 
 # 敏感文件
 *password*
