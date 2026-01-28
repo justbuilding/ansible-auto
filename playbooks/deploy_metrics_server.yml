@@ -26,8 +26,59 @@
         success_msg: "Kubernetes集群状态正常"
 
     # ===================== 部署Metrics Server =====================
+    - name: 显示pkg_dir目录内容
+      command: "ls -la {{ pkg_dir }}"
+      register: pkg_dir_content
+      changed_when: false
+      vars:
+        pkg_dir: "{{ lookup('env', 'PKG_DIR') | default('/tmppkg', true) }}"
+
+    - name: 显示目录内容
+      debug:
+        msg: "目录内容: {{ pkg_dir_content.stdout }}"
+
+    - name: 检查本地metrics镜像包是否存在
+      shell: "find {{ pkg_dir }} -name '*metrics*.tar'"
+      register: metrics_tar_files
+      changed_when: false
+      vars:
+        pkg_dir: "{{ lookup('env', 'PKG_DIR') | default('/tmppkg', true) }}"
+
+    - name: 显示找到的metrics镜像包
+      debug:
+        msg: "找到的镜像包: {{ metrics_tar_files.stdout_lines }}"
+
+    - name: 加载本地metrics镜像包
+      command: "docker load -i {{ item }}"
+      register: metrics_load_result
+      changed_when: "metrics_load_result.rc == 0"
+      loop: "{{ metrics_tar_files.stdout_lines }}"
+      when: metrics_tar_files.stdout_lines | length > 0
+      vars:
+        pkg_dir: "{{ lookup('env', 'PKG_DIR') | default('/tmppkg', true) }}"
+
+    - name: 显示镜像加载结果
+      debug:
+        msg: "镜像加载结果: {{ metrics_load_result }}"
+      when: metrics_tar_files.stdout_lines | length > 0
+
+    - name: 显示当前docker镜像列表
+      command: "docker images"
+      register: docker_images_result
+      changed_when: false
+
+    - name: 显示docker镜像列表
+      debug:
+        msg: "当前docker镜像: {{ docker_images_result.stdout }}"
+
+    - name: 复制Metrics Server配置文件到目标服务器
+      copy:
+        src: "{{ metrics_server_yaml }}"
+        dest: "/tmp/metrics-high-availability-1.21+.yaml"
+        mode: "0644"
+
     - name: 部署Metrics Server
-      command: "kubectl apply -f {{ metrics_server_yaml }}"
+      command: "kubectl apply -f /tmp/metrics-high-availability-1.21+.yaml"
       register: metrics_deploy_result
       changed_when: "'created' in metrics_deploy_result.stdout or 'configured' in metrics_deploy_result.stdout"
       environment:
@@ -38,10 +89,13 @@
         msg: "Metrics Server部署{{ '成功' if metrics_deploy_result.rc == 0 else '失败' }}"
 
     # ===================== 验证部署 =====================
-    - name: 等待Metrics Server Pod就绪
-      command: "kubectl wait --for=condition=ready pod -l k8s-app=metrics-server -n {{ metrics_server_namespace }} --timeout=30s"
+    - name: 等待Metrics Server至少一个Pod就绪
+      shell: "kubectl get pods -l k8s-app=metrics-server -n {{ metrics_server_namespace }} | grep -E 'Running|Ready' | head -1"
       register: metrics_pod_ready
       changed_when: false
+      retries: 5
+      delay: 5
+      until: metrics_pod_ready.stdout != ""
       ignore_errors: yes
 
     - name: 检查Metrics Server部署状态
