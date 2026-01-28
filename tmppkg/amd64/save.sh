@@ -8,6 +8,8 @@ HELM_VERSION="v3.19.2"
 CALICO_VERSION="v3.27.4"
 INGRESS_NGINX_VERSION="v1.12.1"
 CILIUM_VERSION="v1.13.4"
+METRICS_SERVER_VERSION="v0.8.0"
+CERT_MANAGER_VERSION="v1.19.2"
 
 # ===================== 镜像列表配置（无需频繁修改）=====================
 # 格式："镜像完整地址 保存的tar包名"
@@ -17,6 +19,8 @@ images=(
   "registry.cn-shanghai.aliyuncs.com/labring/calico:${CALICO_VERSION} calico.tar"
   "registry.cn-shanghai.aliyuncs.com/labring/ingress-nginx:${INGRESS_NGINX_VERSION} ingress-nginx.tar"
   "registry.cn-shanghai.aliyuncs.com/labring/cilium:${CILIUM_VERSION} cilium.tar"
+  "registry.k8s.io/metrics-server/metrics-server:${METRICS_SERVER_VERSION} metrics.tar"
+  "registry.cn-shanghai.aliyuncs.com/labring/cert-manager:${CERT_MANAGER_VERSION} cert-manager.tar"
 )
 
 # ===================== 核心执行逻辑 =====================
