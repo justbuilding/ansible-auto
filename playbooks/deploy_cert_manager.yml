@@ -1,0 +1,93 @@
+---
+
+- name: 部署Cert-Manager
+  hosts: all
+  become: yes
+  gather_facts: yes
+  vars:
+    # Cert-Manager配置
+    cert_manager_crds_yaml: "{{ playbook_dir }}/../yaml/cert-manager.crds-v1.19.2.yaml"
+    cert_manager_yaml: "{{ playbook_dir }}/../yaml/cert-manager-v1.19.2.yaml"
+    cert_manager_namespace: "cert-manager"
+    cert_manager_deployment: "cert-manager"
+
+  tasks:
+    # ===================== 前置检查 =====================
+    - name: 检查Kubernetes集群是否可用
+      command: "kubectl cluster-info"
+      register: kube_cluster_info
+      changed_when: false
+      ignore_errors: yes
+
+    - name: 验证Kubernetes集群状态
+      assert:
+        that:
+          - kube_cluster_info.rc == 0
+        fail_msg: "Kubernetes集群不可用，请先部署Kubernetes集群"
+        success_msg: "Kubernetes集群状态正常"
+
+    # ===================== 部署Cert-Manager =====================
+    - name: 创建cert-manager命名空间
+      command: "kubectl create namespace {{ cert_manager_namespace }} --dry-run=client -o yaml | kubectl apply -f -"
+      register: create_namespace
+      changed_when: "create_namespace.rc == 0"
+      ignore_errors: yes
+
+    - name: 部署Cert-Manager CRDs
+      command: "kubectl apply -f {{ cert_manager_crds_yaml }}"
+      register: cert_manager_crds_deploy
+      changed_when: "'created' in cert_manager_crds_deploy.stdout or 'configured' in cert_manager_crds_deploy.stdout"
+      environment:
+        KUBECONFIG: "{{ lookup('env', 'KUBECONFIG') | default('/etc/kubernetes/admin.conf', true) }}"
+
+    - name: 显示CRDs部署结果
+      debug:
+        msg: "Cert-Manager CRDs部署{{ '成功' if cert_manager_crds_deploy.rc == 0 else '失败' }}"
+
+    - name: 部署Cert-Manager
+      command: "kubectl apply -f {{ cert_manager_yaml }}"
+      register: cert_manager_deploy
+      changed_when: "'created' in cert_manager_deploy.stdout or 'configured' in cert_manager_deploy.stdout"
+      environment:
+        KUBECONFIG: "{{ lookup('env', 'KUBECONFIG') | default('/etc/kubernetes/admin.conf', true) }}"
+
+    - name: 显示部署结果
+      debug:
+        msg: "Cert-Manager部署{{ '成功' if cert_manager_deploy.rc == 0 else '失败' }}"
+
+    # ===================== 验证部署 =====================
+    - name: 等待Cert-Manager至少一个Pod就绪
+      shell: "kubectl get pods -l app=cert-manager -n {{ cert_manager_namespace }} | grep -E 'Running|Ready' | head -1"
+      register: cert_manager_pod_ready
+      changed_when: false
+      retries: 10
+      delay: 5
+      until: cert_manager_pod_ready.stdout != ""
+      ignore_errors: yes
+
+    - name: 检查Cert-Manager部署状态
+      command: "kubectl get deployment {{ cert_manager_deployment }} -n {{ cert_manager_namespace }}"
+      register: cert_manager_deployment_status
+      changed_when: false
+      ignore_errors: yes
+
+    - name: 显示Cert-Manager状态
+      debug:
+        msg: "{{ cert_manager_deployment_status.stdout }}"
+      when: cert_manager_deployment_status.rc == 0
+
+    # ===================== 部署完成 =====================
+    - name: 部署完成信息
+      debug:
+        msg: |
+          ==============================================================
+          Cert-Manager部署完成
+          ==============================================================
+          部署状态: {{ '成功' if cert_manager_deploy.rc == 0 else '失败' }}
+          Pod就绪状态: {{ '就绪' if cert_manager_pod_ready.stdout != '' else '未就绪' }}
+          ==============================================================
+          提示:
+          - Cert-Manager是一个Kubernetes原生的证书管理控制器
+          - 它可以自动管理和颁发TLS证书
+          - 支持多种证书颁发机构，如Let's Encrypt、HashiCorp Vault等
+          ==============================================================
